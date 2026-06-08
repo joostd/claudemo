@@ -288,6 +288,15 @@ def make_credential(
             rp={"id": rp_id, "name": rp_name or rp_id},
             user={"id": user_id.encode(), "name": user_name},
             key_params=[{"type": "public-key", "alg": -7}],
+            # Platform authenticators that only ever produce passkeys (e.g.
+            # iOS's iCloud Keychain) cannot create a non-discoverable
+            # credential -- and observed behaviour suggests iOS doesn't
+            # return a CTAP2 error for the unsupported combination, but
+            # aborts the request and closes the tunnel outright ("operation
+            # could not be completed" on the phone, "Peer sent a close frame"
+            # here). `rk=True` is also simply what real passkey-creation
+            # requests (`residentKey: "required"`) ask for.
+            options={"rk": True},
         )
         click.echo(response)
 
