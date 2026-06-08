@@ -134,8 +134,11 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   advertisement** -> derive routing ID / tunnel ID / PSK (salted with the full
   16-byte decrypted advert) from it -> connect to the tunnel and run the Noise
   handshake -> read and validate the mandatory post-handshake message (cached
-  `getInfo`) -> wrap the channel in `CtapHybridDevice` and drive it with
-  `fido2.ctap2.Ctap2`.
+  `getInfo`) -> wrap the channel in `CtapHybridDevice` and drive it with a
+  `fido2.ctap2.Ctap2` seeded from that cached `getInfo` (`_ctap2_from_cached_info`,
+  bypassing `Ctap2.__init__`'s own `authenticatorGetInfo` round trip -- the
+  cached response was sent precisely to make that redundant, and at least one
+  real authenticator, iOS, closes the tunnel outright if asked again anyway).
 
 ## Protocol uncertainty -- read before "fixing" the crypto/wire-format code
 

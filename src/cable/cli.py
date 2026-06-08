@@ -159,16 +159,22 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     # The authenticator's first message is a bare (non-type-byte-framed) CBOR
     # map carrying its cached authenticatorGetInfo response, sent to save a
     # round trip. We must read and validate it before any typed CTAP exchange
-    # begins, or the channel will desync from the authenticator's framing.
+    # begins, or the channel will desync from the authenticator's framing --
+    # and, since it *is* the getInfo response, we must also use it as such
+    # rather than asking again: confirmed that some authenticators (iOS) close
+    # the tunnel on a redundant `authenticatorGetInfo` (see `_run_session`).
+    from fido2.ctap2.base import Info
+
     post_handshake = cbor2.loads(await channel.recv_post_handshake())
     if not isinstance(post_handshake, dict) or post_handshake.get(1) is None:
         raise RuntimeError(
             "post-handshake message did not contain a cached authenticatorGetInfo "
             "response (CBOR map key 1) -- protocol framing mismatch."
         )
+    cached_info = Info.from_dict(post_handshake)
     log("Received post-handshake message (cached authenticatorGetInfo response).")
 
-    return channel, result
+    return channel, result, cached_info
 
 
 def _client_data_hash(challenge: bytes) -> bytes:
@@ -261,16 +267,35 @@ def make_credential(
     )
 
 
+def _ctap2_from_cached_info(device, info):
+    """Build a `Ctap2` from the post-handshake cached `getInfo`, bypassing the
+    redundant `authenticatorGetInfo` round trip `Ctap2.__init__` would
+    otherwise make.
+
+    The phone already sent its `getInfo` response as the mandatory
+    post-handshake message specifically to save this round trip (CTAP 2.3
+    sctn-hybrid) -- and at least one real authenticator (iOS) closes the
+    tunnel outright ("Peer sent a close frame") if we ask again anyway.
+    """
+    from fido2.ctap2.base import Ctap2
+
+    ctap2 = Ctap2.__new__(Ctap2)
+    ctap2.device = device
+    ctap2._strict_cbor = True
+    ctap2._info = info
+    ctap2._max_msg_size = info.max_msg_size
+    return ctap2
+
+
 def _run_session(*, request_type, debug_noise, action) -> None:
     from fido2.ctap import CtapError
-    from fido2.ctap2.base import Ctap2
     from websockets.exceptions import WebSocketException
 
     loop = _BackgroundLoop()
     device = None
     try:
         try:
-            channel, _result = loop.run(
+            channel, _result, cached_info = loop.run(
                 _connect_and_handshake(
                     request_type=request_type,
                     debug_noise=debug_noise,
@@ -278,7 +303,7 @@ def _run_session(*, request_type, debug_noise, action) -> None:
             )
 
             device = CtapHybridDevice(channel, background_loop=loop)
-            ctap2 = Ctap2(device)
+            ctap2 = _ctap2_from_cached_info(device, cached_info)
             action(ctap2)
         except (OSError, WebSocketException) as exc:
             raise click.ClickException(f"could not reach the tunnel server: {exc}") from exc
