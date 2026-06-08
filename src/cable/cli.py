@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import secrets
 import time
@@ -157,18 +158,60 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     channel = CableChannel(tunnel, send_cipher=result.send_cipher, receive_cipher=result.receive_cipher)
 
     # The authenticator's first message is a bare (non-type-byte-framed) CBOR
-    # map carrying its cached authenticatorGetInfo response, sent to save a
-    # round trip. We must read and validate it before any typed CTAP exchange
-    # begins, or the channel will desync from the authenticator's framing.
+    # *wrapper* map carrying its cached authenticatorGetInfo response under
+    # key 1 -- CBOR-in-CBOR: that key's value is itself a byte string holding
+    # the getInfo response map's canonical CBOR encoding, not the decoded map
+    # directly (confirmed by reassembling the bytes a naive `Info.from_dict`
+    # on the *outer* map misparsed into `versions` -- they decode cleanly to
+    # `{1: ['FIDO_2_0', ...], 4: {'rk': True, 'uv': True, ...}, ...}`).
+    # We must read and validate it before any typed CTAP exchange begins, or
+    # the channel will desync from the authenticator's framing -- and, since
+    # it *is* the getInfo response, we must also use it as such rather than
+    # asking again: confirmed that some authenticators (iOS) close the tunnel
+    # on a redundant `authenticatorGetInfo` (see `_run_session`).
     post_handshake = cbor2.loads(await channel.recv_post_handshake())
-    if not isinstance(post_handshake, dict) or post_handshake.get(1) is None:
+    if not isinstance(post_handshake, dict) or not isinstance(post_handshake.get(1), bytes):
         raise RuntimeError(
             "post-handshake message did not contain a cached authenticatorGetInfo "
-            "response (CBOR map key 1) -- protocol framing mismatch."
+            "response (CBOR map key 1, holding a nested CBOR-encoded getInfo byte "
+            "string) -- protocol framing mismatch."
         )
+    cached_info = _lenient_info_from_dict(cbor2.loads(post_handshake[1]))
     log("Received post-handshake message (cached authenticatorGetInfo response).")
 
-    return channel, result
+    return channel, result, cached_info
+
+
+def _lenient_info_from_dict(data: dict):
+    """Like `Info.from_dict`, but tolerates individual fields the installed
+    `fido2` can't parse rather than failing on the whole response.
+
+    Confirmed against a real iOS authenticator: its cached getInfo includes
+    fields (observed: `encIdentifier`/`pinComplexityPolicyURL`/
+    `encCredStoreState`, CBOR keys 25/28/30) whose values are CBOR
+    arrays/maps where this `fido2` version's `Info` dataclass expects
+    `bytes` -- almost certainly a spec-draft/library-version skew over these
+    newer, less-stable fields, not malformed data. `Info.from_dict` aborts
+    the *entire* parse on the first such mismatch (e.g. `bytes(['a', 'b'])`
+    raising "'str' object cannot be interpreted as an integer"); dropping
+    just the offending fields still yields a perfectly usable `Info` --
+    `Ctap2` only ever consults the well-established core fields.
+    """
+    from typing import get_type_hints
+
+    from fido2.ctap2.base import Info
+
+    hints = get_type_hints(Info)
+    kwargs = {}
+    for f in dataclasses.fields(Info):
+        value = data.get(Info._get_field_key(f))
+        if value is None:
+            continue
+        try:
+            kwargs[f.name] = Info._parse_value(hints[f.name], value)
+        except (TypeError, ValueError):
+            continue
+    return Info(**kwargs)
 
 
 def _client_data_hash(challenge: bytes) -> bytes:
@@ -233,6 +276,7 @@ def get_assertion(rp_id: str, challenge: str, debug_noise: bool) -> None:
 @click.option("--rp-name", default="")
 @click.option("--user-id", required=True, help="User ID string (will be UTF-8 encoded).")
 @click.option("--user-name", required=True)
+@click.option("--display-name", default="", help="Defaults to --user-name.")
 @click.option("--challenge", required=True, help="Challenge string (will be SHA-256 hashed).")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
 def make_credential(
@@ -240,17 +284,36 @@ def make_credential(
     rp_name: str,
     user_id: str,
     user_name: str,
+    display_name: str,
     challenge: str,
     debug_noise: bool,
 ) -> None:
     """Request a CTAP2 MakeCredential from the phone."""
 
     def action(ctap2):
+        # WebAuthn's PublicKeyCredentialUserEntity requires both `name` *and*
+        # `displayName` for registration (unlike `get_assertion`, which never
+        # sends a user entity at all) -- real clients always populate both.
+        # Sending a `user` map missing `displayName` is the one structural
+        # way this request differs from the `get_assertion` one that iOS
+        # *does* process interactively (Face ID + success UI): a plausible
+        # trigger for a strict authenticator to reject the entity outright,
+        # silently, before ever reaching the UV/UI step ("operation could not
+        # be completed" on the phone, "Peer sent a close frame" here).
         response = ctap2.make_credential(
             client_data_hash=_client_data_hash(challenge.encode()),
             rp={"id": rp_id, "name": rp_name or rp_id},
-            user={"id": user_id.encode(), "name": user_name},
+            user={
+                "id": user_id.encode(),
+                "name": user_name,
+                "displayName": display_name or user_name,
+            },
             key_params=[{"type": "public-key", "alg": -7}],
+            # Platform authenticators that only ever produce passkeys (e.g.
+            # iOS's iCloud Keychain) cannot create a non-discoverable
+            # credential; `rk=True` is what real passkey-creation requests
+            # (`residentKey: "required"`) ask for.
+            options={"rk": True},
         )
         click.echo(response)
 
@@ -261,16 +324,35 @@ def make_credential(
     )
 
 
+def _ctap2_from_cached_info(device, info):
+    """Build a `Ctap2` from the post-handshake cached `getInfo`, bypassing the
+    redundant `authenticatorGetInfo` round trip `Ctap2.__init__` would
+    otherwise make.
+
+    The phone already sent its `getInfo` response as the mandatory
+    post-handshake message specifically to save this round trip (CTAP 2.3
+    sctn-hybrid) -- and at least one real authenticator (iOS) closes the
+    tunnel outright ("Peer sent a close frame") if we ask again anyway.
+    """
+    from fido2.ctap2.base import Ctap2
+
+    ctap2 = Ctap2.__new__(Ctap2)
+    ctap2.device = device
+    ctap2._strict_cbor = True
+    ctap2._info = info
+    ctap2._max_msg_size = info.max_msg_size
+    return ctap2
+
+
 def _run_session(*, request_type, debug_noise, action) -> None:
     from fido2.ctap import CtapError
-    from fido2.ctap2.base import Ctap2
     from websockets.exceptions import WebSocketException
 
     loop = _BackgroundLoop()
     device = None
     try:
         try:
-            channel, _result = loop.run(
+            channel, _result, cached_info = loop.run(
                 _connect_and_handshake(
                     request_type=request_type,
                     debug_noise=debug_noise,
@@ -278,7 +360,7 @@ def _run_session(*, request_type, debug_noise, action) -> None:
             )
 
             device = CtapHybridDevice(channel, background_loop=loop)
-            ctap2 = Ctap2(device)
+            ctap2 = _ctap2_from_cached_info(device, cached_info)
             action(ctap2)
         except (OSError, WebSocketException) as exc:
             raise click.ClickException(f"could not reach the tunnel server: {exc}") from exc

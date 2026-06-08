@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 
 import cbor2
-import qrcode
+import pyqrcode
 
 from . import base10
 from .constants import (
@@ -91,17 +91,18 @@ def build_fido_uri(handshake: HandshakeV2) -> str:
     return FIDO_URI_PREFIX + base10.encode(cbor_bytes)
 
 
-def render_qr_ascii(uri: str, *, out=None, invert: bool = False) -> None:
-    """Render `uri` as an ASCII-art QR code to a stream (default: stdout)."""
+def render_qr_ascii(uri: str, *, out=None) -> None:
+    """Render `uri` as an ANSI-art QR code to a stream (default: stdout).
+
+    `FIDO:/<digits>` URIs only ever contain characters from the QR
+    alphanumeric character set, so we can pin `mode='alphanumeric'` (denser
+    encoding, smaller code) and `error='L'` (least redundancy, smaller code).
+    """
     if out is None:
         out = sys.stdout
 
-    qr = qrcode.QRCode(border=2)
-    qr.add_data(uri)
-    qr.make(fit=True)
-
-    tty = bool(getattr(out, "isatty", lambda: False)())
-    qr.print_ascii(out=out, tty=tty, invert=invert)
+    code = pyqrcode.create(uri, mode="alphanumeric", error="L")
+    out.write(code.terminal(quiet_zone=1))
 
 
 __all__ = [

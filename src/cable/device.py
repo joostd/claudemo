@@ -107,24 +107,35 @@ class CtapHybridDevice(CtapDevice):
     async def _call_async(self, data: bytes, event: "threading.Event | None") -> bytes:
         await self._channel.send_message(CableFrameType.CTAP, data)
 
-        while True:
-            if event is not None and event.is_set():
-                raise CtapError(CtapError.ERR.KEEPALIVE_CANCEL)
+        # `asyncio.shield` protects the in-flight `recv_message()` from being
+        # cancelled by `wait_for`'s per-iteration timeout (which exists only
+        # to let us re-check `event` periodically) -- but the shielded task
+        # must be *reused* across iterations, not recreated, or two
+        # overlapping `recv()` calls would race on the same channel/websocket
+        # ("cannot call recv while another coroutine is already running recv").
+        recv_task = asyncio.ensure_future(self._channel.recv_message())
+        try:
+            while True:
+                if event is not None and event.is_set():
+                    raise CtapError(CtapError.ERR.KEEPALIVE_CANCEL)
 
-            recv_task = asyncio.ensure_future(self._channel.recv_message())
-            try:
-                message = await asyncio.wait_for(asyncio.shield(recv_task), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+                try:
+                    message = await asyncio.wait_for(asyncio.shield(recv_task), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
 
-            if message.frame_type == CableFrameType.SHUTDOWN:
-                raise CtapError(CtapError.ERR.OTHER)
-            if message.frame_type != CableFrameType.CTAP:
-                # Unrecognised/Update frames: ignore and keep waiting for the
-                # actual CTAP response.
-                continue
+                if message.frame_type == CableFrameType.SHUTDOWN:
+                    raise CtapError(CtapError.ERR.OTHER)
+                if message.frame_type != CableFrameType.CTAP:
+                    # Unrecognised/Update frames: discard and wait for the
+                    # actual CTAP response on a fresh receive.
+                    recv_task = asyncio.ensure_future(self._channel.recv_message())
+                    continue
 
-            return message.payload
+                return message.payload
+        finally:
+            if not recv_task.done():
+                recv_task.cancel()
 
     @classmethod
     def list_devices(cls) -> Iterator["CtapHybridDevice"]:

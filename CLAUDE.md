@@ -65,7 +65,9 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   definition; encoder derived as its provable inverse).
 - `qr.py` -- `HandshakeV2` CBOR payload (33-byte compressed P-256
   `peer_identity`, 16-byte `secret`, integer list of `supported_transports`,
-  ...) + ASCII QR rendering (`qrcode`).
+  ...) + terminal QR rendering via `pyqrcode`'s `QRCode.terminal()`
+  (alphanumeric mode, error correction `L` -- `FIDO:/<digits>` URIs only ever
+  use the QR alphanumeric character set, so this yields the smallest code).
 - `crypto/kdf.py` -- HKDF-SHA256 derivations of session secrets from the QR
   secret (EID key, tunnel ID, PSK, ...), keyed by small-integer purpose codes
   (1/2/3/...) packed as 4-byte *little-endian* `info` (`DerivedValueType`).
@@ -132,8 +134,34 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   advertisement** -> derive routing ID / tunnel ID / PSK (salted with the full
   16-byte decrypted advert) from it -> connect to the tunnel and run the Noise
   handshake -> read and validate the mandatory post-handshake message (cached
-  `getInfo`) -> wrap the channel in `CtapHybridDevice` and drive it with
-  `fido2.ctap2.Ctap2`.
+  `getInfo`) -> wrap the channel in `CtapHybridDevice` and drive it with a
+  `fido2.ctap2.Ctap2` seeded from that cached `getInfo` (`_ctap2_from_cached_info`,
+  bypassing `Ctap2.__init__`'s own `authenticatorGetInfo` round trip -- the
+  cached response was sent precisely to make that redundant, and at least one
+  real authenticator, iOS, closes the tunnel outright if asked again anyway).
+  The post-handshake message is itself a CBOR *wrapper* map whose key 1 holds
+  the actual `getInfo` response CBOR-encoded as a nested byte string --
+  CBOR-in-CBOR, confirmed by reassembling a real iOS device's bytes (a naive
+  parse of the outer map as `Info` directly misparses every field, e.g.
+  `versions` ends up holding the raw bytes of the inner encoding one byte at a
+  time; decoding `outer[1]` separately yields a clean
+  `{1: ['FIDO_2_0', ...], 4: {'rk': True, 'uv': True, ...}, ...}`) -- so
+  `cbor2.loads(outer[1])` must run before `_lenient_info_from_dict`. That
+  cached `getInfo` is parsed leniently (`_lenient_info_from_dict`): confirmed
+  that iOS includes newer/draft fields (`encIdentifier`,
+  `pinComplexityPolicyURL`, `encCredStoreState`) shaped differently than this
+  `fido2` version's `Info` dataclass expects (arrays/maps where it wants
+  `bytes`), which makes the strict `Info.from_dict` abort the entire parse --
+  fields it can't parse are dropped instead, since `Ctap2` only ever consults
+  the well-established core fields. `make-credential` also always populates
+  `user.displayName` (`--display-name`, defaulting to `--user-name`):
+  WebAuthn's `PublicKeyCredentialUserEntity` requires it for registration
+  (unlike `get_assertion`, which never sends a user entity at all -- the one
+  structural way these requests differ), and a `user` map missing it is a
+  plausible trigger for a strict platform authenticator to reject the
+  request outright before any UI (observed on iOS: no Face ID prompt, no
+  CTAP2 error, just an immediate "operation could not be completed" /
+  tunnel close).
 
 ## Protocol uncertainty -- read before "fixing" the crypto/wire-format code
 
