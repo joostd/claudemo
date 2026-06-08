@@ -276,6 +276,7 @@ def get_assertion(rp_id: str, challenge: str, debug_noise: bool) -> None:
 @click.option("--rp-name", default="")
 @click.option("--user-id", required=True, help="User ID string (will be UTF-8 encoded).")
 @click.option("--user-name", required=True)
+@click.option("--display-name", default="", help="Defaults to --user-name.")
 @click.option("--challenge", required=True, help="Challenge string (will be SHA-256 hashed).")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
 def make_credential(
@@ -283,30 +284,36 @@ def make_credential(
     rp_name: str,
     user_id: str,
     user_name: str,
+    display_name: str,
     challenge: str,
     debug_noise: bool,
 ) -> None:
     """Request a CTAP2 MakeCredential from the phone."""
 
     def action(ctap2):
-        # iOS's cached getInfo (correctly parsed -- see the post-handshake
-        # CBOR-in-CBOR fix in `_connect_and_handshake`) reports
-        # `options: {rk: True, uv: True, jsonMessages: True}`: no `clientPin`/
-        # `pinUvAuthToken`, i.e. it authenticates via *built-in* user
-        # verification requested directly through the `uv` option (the older,
-        # token-less mechanism), not the `authenticatorClientPIN` token dance.
-        # Without `uv: true` here, iOS apparently won't perform (or even
-        # prompt for) the verification a passkey-creation ceremony requires --
-        # and rather than return a structured CTAP2 error for the unmet
-        # requirement, it silently aborts and closes the tunnel ("operation
-        # could not be completed" on the phone, "Peer sent a close frame"
-        # here).
+        # WebAuthn's PublicKeyCredentialUserEntity requires both `name` *and*
+        # `displayName` for registration (unlike `get_assertion`, which never
+        # sends a user entity at all) -- real clients always populate both.
+        # Sending a `user` map missing `displayName` is the one structural
+        # way this request differs from the `get_assertion` one that iOS
+        # *does* process interactively (Face ID + success UI): a plausible
+        # trigger for a strict authenticator to reject the entity outright,
+        # silently, before ever reaching the UV/UI step ("operation could not
+        # be completed" on the phone, "Peer sent a close frame" here).
         response = ctap2.make_credential(
             client_data_hash=_client_data_hash(challenge.encode()),
             rp={"id": rp_id, "name": rp_name or rp_id},
-            user={"id": user_id.encode(), "name": user_name},
+            user={
+                "id": user_id.encode(),
+                "name": user_name,
+                "displayName": display_name or user_name,
+            },
             key_params=[{"type": "public-key", "alg": -7}],
-            options={"rk": True, "uv": True},
+            # Platform authenticators that only ever produce passkeys (e.g.
+            # iOS's iCloud Keychain) cannot create a non-discoverable
+            # credential; `rk=True` is what real passkey-creation requests
+            # (`residentKey: "required"`) ask for.
+            options={"rk": True},
         )
         click.echo(response)
 

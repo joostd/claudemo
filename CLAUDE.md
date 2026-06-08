@@ -153,13 +153,15 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   `fido2` version's `Info` dataclass expects (arrays/maps where it wants
   `bytes`), which makes the strict `Info.from_dict` abort the entire parse --
   fields it can't parse are dropped instead, since `Ctap2` only ever consults
-  the well-established core fields. (iOS's real `options` --
-  `{rk: True, uv: True, jsonMessages: True}` -- is also why
-  `make-credential` passes `options={"rk": True, "uv": True}`: it
-  authenticates passkey creation via *built-in* UV requested directly through
-  the `uv` option, not the `clientPin`/`pinUvAuthToken` token mechanism, and
-  silently aborts the request -- no prompt, no CTAP2 error, just a tunnel
-  close -- if `uv` isn't requested.)
+  the well-established core fields. `make-credential` also always populates
+  `user.displayName` (`--display-name`, defaulting to `--user-name`):
+  WebAuthn's `PublicKeyCredentialUserEntity` requires it for registration
+  (unlike `get_assertion`, which never sends a user entity at all -- the one
+  structural way these requests differ), and a `user` map missing it is a
+  plausible trigger for a strict platform authenticator to reject the
+  request outright before any UI (observed on iOS: no Face ID prompt, no
+  CTAP2 error, just an immediate "operation could not be completed" /
+  tunnel close).
 
 ## Protocol uncertainty -- read before "fixing" the crypto/wire-format code
 
