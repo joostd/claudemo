@@ -84,10 +84,19 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   - the `"e"` token both `mixHash`es **and** `mixKey`s the raw ephemeral
     public-key bytes (not just `mixHash`, as plain Noise would do);
   - `pad_message`/`unpad_message` (granularity `TRANSPORT_PADDING_GRANULARITY`
-    = 32, last byte = padding length minus one) and a `CipherState` whose AEAD
-    nonce is an 8-byte all-zero prefix plus a **big-endian** 4-byte counter --
-    both belong conceptually to transport encryption (post-handshake), not the
-    handshake itself, but live here alongside `CipherState`.
+    = 32, last byte = padding length minus one) belong conceptually to
+    transport encryption (post-handshake), not the handshake itself, but live
+    here alongside `CipherState`;
+  - `CipherState` builds its AEAD nonce as a big-endian 4-byte counter plus an
+    all-zero remainder, but the counter's *placement* depends on context
+    (confirmed against Chromium's `device/fido/cable/{noise,v2_handshake}.cc`
+    -- getting this backwards causes silent AEAD authentication failure on the
+    very first encrypted handshake payload, which manifests on the peer as an
+    immediate abort): `Noise::EncryptAndHash`/`DecryptAndHash` (driving
+    `SymmetricState.cipher` during the handshake) place the counter in the
+    *first* 4 bytes (`counter_prefix=True`), while `Crypter::ConstructNonce`
+    (the post-handshake transport ciphers returned by `SymmetricState.split`)
+    place it in the *last* 4 bytes (`counter_prefix=False`, the default).
 
   The token sequences live in `HANDSHAKE_PATTERNS`/`PATTERN_KN_PSK0`/
   `PATTERN_NK_PSK0` so a wrong pattern assumption requires changing only that

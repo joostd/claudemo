@@ -229,8 +229,28 @@ def unpad_message(padded: bytes) -> bytes:
 
 @dataclass
 class CipherState:
+    """AES-256-GCM cipher state with caBLE's big-endian-counter AEAD nonce.
+
+    caBLE uses *two different* placements for the 4-byte big-endian counter
+    within the 12-byte AEAD nonce, depending on context (confirmed against
+    Chromium's `device/fido/cable/{noise,v2_handshake}.cc`):
+
+    - During the Noise handshake itself, `Noise::EncryptAndHash`/
+      `DecryptAndHash` build `nonce = counter(BE,4) || 0x00*8` -- the counter
+      occupies the *first* 4 bytes (`counter_prefix=True`).
+    - Post-handshake transport encryption (`Crypter::ConstructNonce`, reached
+      via `SymmetricState.split()`) builds `nonce = 0x00*8 || counter(BE,4)`
+      -- the counter occupies the *last* 4 bytes (`counter_prefix=False`,
+      the default).
+
+    Mixing these up causes AEAD authentication of the very first encrypted
+    handshake payload to fail (wrong nonce -> wrong tag), which is silent on
+    our side but makes the peer immediately abort the connection.
+    """
+
     key: bytes | None = None
     nonce: int = 0
+    counter_prefix: bool = False
 
     def initialize(self, key: bytes) -> None:
         self.key = key
@@ -240,12 +260,11 @@ class CipherState:
         return self.key is not None
 
     def _nonce_bytes(self) -> bytes:
-        # CTAP 2.3 sctn-hybrid: nonces are per-direction counters, big-endian
-        # encoded into the low-order 4 bytes of the 12-byte AEAD nonce (the
-        # high-order 8 bytes are zero). This is *not* the generic Noise
-        # convention (64-bit LE counter in the low bytes) -- it's specific to
-        # caBLE's post-handshake transport encryption.
-        nonce = b"\x00\x00\x00\x00\x00\x00\x00\x00" + self.nonce.to_bytes(4, "big")
+        counter = self.nonce.to_bytes(4, "big")
+        if self.counter_prefix:
+            nonce = counter + b"\x00" * 8
+        else:
+            nonce = b"\x00" * 8 + counter
         assert len(nonce) == NOISE_AEAD_NONCE_SIZE
         return nonce
 
@@ -268,7 +287,11 @@ class CipherState:
 class SymmetricState:
     chaining_key: bytes
     hash_value: bytes
-    cipher: CipherState = field(default_factory=CipherState)
+    # `counter_prefix=True`: this cipher encrypts/decrypts handshake payloads
+    # via `Noise::EncryptAndHash`/`DecryptAndHash`, which place the AEAD nonce
+    # counter in the *first* 4 bytes -- distinct from the post-handshake
+    # transport ciphers produced by `split()` (see `CipherState` docstring).
+    cipher: CipherState = field(default_factory=lambda: CipherState(counter_prefix=True))
 
     @classmethod
     def initialize(cls, protocol_name: bytes) -> "SymmetricState":
