@@ -1,0 +1,27 @@
+[project]
+name = "cable"
+version = "0.1.0"
+description = "Command-line FIDO client using hybrid transport (caBLE v2) to talk to a phone authenticator"
+requires-python = ">=3.10"
+dependencies = [
+    "cbor2",
+    "qrcode",
+    "cryptography",
+    "websockets",
+    "bleak",
+    "fido2",
+    "click",
+]
+
+[project.scripts]
+cable = "cable.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
