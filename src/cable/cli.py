@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import secrets
 import time
@@ -163,18 +164,48 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     # and, since it *is* the getInfo response, we must also use it as such
     # rather than asking again: confirmed that some authenticators (iOS) close
     # the tunnel on a redundant `authenticatorGetInfo` (see `_run_session`).
-    from fido2.ctap2.base import Info
-
     post_handshake = cbor2.loads(await channel.recv_post_handshake())
     if not isinstance(post_handshake, dict) or post_handshake.get(1) is None:
         raise RuntimeError(
             "post-handshake message did not contain a cached authenticatorGetInfo "
             "response (CBOR map key 1) -- protocol framing mismatch."
         )
-    cached_info = Info.from_dict(post_handshake)
+    cached_info = _lenient_info_from_dict(post_handshake)
     log("Received post-handshake message (cached authenticatorGetInfo response).")
 
     return channel, result, cached_info
+
+
+def _lenient_info_from_dict(data: dict):
+    """Like `Info.from_dict`, but tolerates individual fields the installed
+    `fido2` can't parse rather than failing on the whole response.
+
+    Confirmed against a real iOS authenticator: its cached getInfo includes
+    fields (observed: `encIdentifier`/`pinComplexityPolicyURL`/
+    `encCredStoreState`, CBOR keys 25/28/30) whose values are CBOR
+    arrays/maps where this `fido2` version's `Info` dataclass expects
+    `bytes` -- almost certainly a spec-draft/library-version skew over these
+    newer, less-stable fields, not malformed data. `Info.from_dict` aborts
+    the *entire* parse on the first such mismatch (e.g. `bytes(['a', 'b'])`
+    raising "'str' object cannot be interpreted as an integer"); dropping
+    just the offending fields still yields a perfectly usable `Info` --
+    `Ctap2` only ever consults the well-established core fields.
+    """
+    from typing import get_type_hints
+
+    from fido2.ctap2.base import Info
+
+    hints = get_type_hints(Info)
+    kwargs = {}
+    for f in dataclasses.fields(Info):
+        value = data.get(Info._get_field_key(f))
+        if value is None:
+            continue
+        try:
+            kwargs[f.name] = Info._parse_value(hints[f.name], value)
+        except (TypeError, ValueError):
+            continue
+    return Info(**kwargs)
 
 
 def _client_data_hash(challenge: bytes) -> bytes:

@@ -139,6 +139,13 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   bypassing `Ctap2.__init__`'s own `authenticatorGetInfo` round trip -- the
   cached response was sent precisely to make that redundant, and at least one
   real authenticator, iOS, closes the tunnel outright if asked again anyway).
+  That cached `getInfo` is parsed leniently (`_lenient_info_from_dict`):
+  confirmed that iOS includes newer/draft fields (`encIdentifier`,
+  `pinComplexityPolicyURL`, `encCredStoreState`) shaped differently than this
+  `fido2` version's `Info` dataclass expects (arrays/maps where it wants
+  `bytes`), which makes the strict `Info.from_dict` abort the entire parse --
+  fields it can't parse are dropped instead, since `Ctap2` only ever consults
+  the well-established core fields.
 
 ## Protocol uncertainty -- read before "fixing" the crypto/wire-format code
 
