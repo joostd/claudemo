@@ -368,7 +368,6 @@ class NoiseHandshake:
         local_ephemeral: KeyPair | None = None,
         remote_static_public: bytes | None = None,
         psk: bytes,
-        prologue: bytes = b"",
         debug_log: Callable[[str, dict], None] | None = None,
     ) -> None:
         if role not in ("initiator", "responder"):
@@ -380,7 +379,6 @@ class NoiseHandshake:
         self.debug_log = debug_log or (lambda *_: None)
 
         self.symmetric = SymmetricState.initialize(pattern["name"])
-        self.symmetric.mix_hash(prologue)
 
         self.local_static = local_static
         self.local_ephemeral = local_ephemeral
