@@ -76,8 +76,11 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   textbook Noise baked into the pattern tables and shared helpers rather than
   scattered through the state machine:
   - a **prologue** step (`PATTERN_*["prologue_owner"]`/`["prologue_byte"]`):
-    `mixHash([0 or 1])` then `mixHash` of the *compressed* static public key
-    owned by whichever side the pattern designates, before any tokens run;
+    `mixHash([0 or 1])` then `mixHash` of the *uncompressed* (65-byte X9.62)
+    static public key owned by whichever side the pattern designates --
+    the same encoding used for every in-handshake DH token, even though the
+    QR only ever conveys that key in compressed (33-byte) form -- before any
+    tokens run;
   - the `"e"` token both `mixHash`es **and** `mixKey`s the raw ephemeral
     public-key bytes (not just `mixHash`, as plain Noise would do);
   - `pad_message`/`unpad_message` (granularity `TRANSPORT_PADDING_GRANULARITY`

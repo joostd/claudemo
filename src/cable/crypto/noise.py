@@ -377,30 +377,26 @@ class NoiseHandshake:
         QR code -- followed by `mix_hash` (not `mix_key`) of that static key:
         `ns.mixHash([]byte{0 or 1}); ns.mixHashPoint(...)`.
 
-        Critically, `mixHashPoint` mixes in the *compressed* (33-byte X9.62)
-        encoding -- the same encoding carried in the QR's `peer_identity`
-        field -- not the 65-byte uncompressed encoding `KeyPair.public_bytes`
-        uses for the in-handshake DH tokens. The two sides only ever agree on
-        the compressed form (it's the only encoding conveyed out-of-band via
-        the QR), so mixing the uncompressed form here desyncs the transcript
-        hash from message zero and the responder rejects the handshake.
+        `mixHashPoint` mixes in the *uncompressed* 65-byte X9.62 encoding --
+        the same `NOISE_DH_PUBLIC_KEY_SIZE` form used for every in-handshake
+        DH token -- not the 33-byte compressed form carried in the QR's
+        `peer_identity` field. The responder decompresses that QR-carried key
+        to the uncompressed form before mixing it in, so both sides agree on
+        the uncompressed encoding here (confirmed against Chromium's
+        `device/fido/cable/v2_handshake.cc`: `MixHashPoint` round-trips
+        through an uncompressed `EC_POINT` encoding, and the NK branch mixes
+        `*peer_identity_`, which is stored as `kP256X962Length` = 65 bytes).
         """
         owner = self.pattern["prologue_owner"]
         self.symmetric.mix_hash(bytes([self.pattern["prologue_byte"]]))
         if owner == self.role:
             if self.local_static is None:
                 raise ValueError("pattern requires a local static key that was not provided")
-            self.symmetric.mix_hash(serialize_public_key_compressed(self.local_static.private_key.public_key()))
+            self.symmetric.mix_hash(self.local_static.public_bytes)
         else:
             if self.remote_static_public is None:
                 raise ValueError("pattern requires a remote static key that was not provided")
-            # `remote_static_public` is stored in the raw (uncompressed,
-            # NOISE_DH_PUBLIC_KEY_SIZE-byte) DH-wire encoding `dh()` needs for
-            # the "s"/"ss"/"es"/"se" tokens -- re-encode to compressed for the
-            # prologue, same as the local-static branch above.
-            self.symmetric.mix_hash(
-                serialize_public_key_compressed(deserialize_public_key(self.remote_static_public))
-            )
+            self.symmetric.mix_hash(self.remote_static_public)
         self.debug_log("prologue", self._snapshot())
 
     def _snapshot(self) -> dict:
