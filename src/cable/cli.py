@@ -39,6 +39,21 @@ def _log(message: str) -> None:
     click.echo(click.style("==> ", fg="cyan", bold=True) + message, err=True)
 
 
+def _timed_log(start: float):
+    """Return a `_log` wrapper that prefixes messages with elapsed seconds.
+
+    Useful for diagnosing whether the phone abandons its tunnel session
+    (rotates routing ID, gives up waiting, ...) before we finish processing
+    the BLE advertisement and connect -- a race that would manifest as a
+    silently undelivered first handshake message.
+    """
+
+    def log(message: str) -> None:
+        _log(f"[+{time.monotonic() - start:6.2f}s] {message}")
+
+    return log
+
+
 async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     """Run the QR-initiated connection flow end to end (CTAP 2.3 sctn-hybrid).
 
@@ -48,6 +63,9 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     tunnel) and the salt for the Noise PSK, so nothing else can proceed
     without it.
     """
+    start = time.monotonic()
+    log = _timed_log(start)
+
     qr_secret = secrets.token_bytes(16)
     keypair = noise.generate_keypair()
     peer_identity = noise.serialize_public_key_compressed(keypair.private_key.public_key())
@@ -63,12 +81,12 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     click.echo()
     qr.render_qr_ascii(uri)
     click.echo()
-    _log("Scan this QR code with your phone's authenticator app.")
-    _log(f"URI: {uri}")
+    log("Scan this QR code with your phone's authenticator app.")
+    log(f"URI: {uri}")
     click.echo()
 
     eid_key = derive_eid_key(qr_secret)
-    _log("Waiting for the phone's BLE advertisement (carries the routing ID and proves proximity)...")
+    log("Waiting for the phone's BLE advertisement (carries the routing ID and proves proximity)...")
     advert_plaintext = await ble.scan_for_eid(eid_key)
     if advert_plaintext is None:
         raise RuntimeError(
@@ -76,30 +94,30 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
             "flow cannot proceed without one -- it is the only source of the "
             "routing ID and the Noise PSK salt (see CTAP 2.3 sctn-hybrid)."
         )
-    _log("BLE advertisement received and verified ✓")
+    log("BLE advertisement received and verified ✓")
 
     advert = parse_plaintext_eid(advert_plaintext)
     routing_id = advert["routing_id"]
     domain_id = advert["tunnel_server_id"]
-    _log(
+    log(
         f"Decrypted advertisement: nonce={advert['nonce'].hex()} "
         f"routing_id={routing_id.hex().upper()} domain_id={domain_id} "
         f"(plaintext={advert_plaintext.hex()})"
     )
 
     tunnel_id = derive_tunnel_id(qr_secret)
-    _log(f"Derived tunnel_id={tunnel_id.hex().upper()} from qr_secret={qr_secret.hex()}")
+    log(f"Derived tunnel_id={tunnel_id.hex().upper()} from qr_secret={qr_secret.hex()}")
     url = tunnel_url(domain_id, routing_id, tunnel_id)
 
-    _log(f"Connecting to tunnel server ({url})...")
+    log(f"Connecting to tunnel server ({url})...")
     tunnel = await TunnelConnection.connect(url)
-    _log(
+    log(
         f"Connected (selected subprotocol={getattr(tunnel._websocket, 'subprotocol', None)!r}, "
         f"routing-id header={tunnel.routing_id!r}). Starting Noise handshake..."
     )
 
     def _log_noise_step(step, snapshot):
-        _log(f"[noise:{step}] chaining_key={snapshot['chaining_key']} hash={snapshot['hash']}")
+        log(f"[noise:{step}] chaining_key={snapshot['chaining_key']} hash={snapshot['hash']}")
 
     debug_log = _log_noise_step if debug_noise else None
 
@@ -118,12 +136,12 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     )
 
     first_message = handshake_state.write_message()
-    _log(f"Sending first handshake message ({len(first_message)} bytes: {first_message.hex()})...")
+    log(f"Sending first handshake message ({len(first_message)} bytes: {first_message.hex()})...")
     await tunnel.send(first_message)
-    _log("First handshake message sent; awaiting response...")
+    log("First handshake message sent; awaiting response...")
 
     response = await tunnel.recv()
-    _log(f"Received handshake response ({len(response)} bytes: {response.hex()}).")
+    log(f"Received handshake response ({len(response)} bytes: {response.hex()}).")
     handshake_state.read_message(response)
 
     if not handshake_state.is_complete():
@@ -134,7 +152,7 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
         )
 
     result = handshake_state.finish()
-    _log("Noise handshake complete; tunnel is now end-to-end encrypted.")
+    log("Noise handshake complete; tunnel is now end-to-end encrypted.")
 
     channel = CableChannel(tunnel, send_cipher=result.send_cipher, receive_cipher=result.receive_cipher)
 
@@ -148,7 +166,7 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
             "post-handshake message did not contain a cached authenticatorGetInfo "
             "response (CBOR map key 1) -- protocol framing mismatch."
         )
-    _log("Received post-handshake message (cached authenticatorGetInfo response).")
+    log("Received post-handshake message (cached authenticatorGetInfo response).")
 
     return channel, result
 
