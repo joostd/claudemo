@@ -109,9 +109,12 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     )
 
     first_message = handshake_state.write_message()
+    _log(f"Sending first handshake message ({len(first_message)} bytes: {first_message.hex()})...")
     await tunnel.send(first_message)
+    _log("First handshake message sent; awaiting response...")
 
     response = await tunnel.recv()
+    _log(f"Received handshake response ({len(response)} bytes: {response.hex()}).")
     handshake_state.read_message(response)
 
     if not handshake_state.is_complete():
