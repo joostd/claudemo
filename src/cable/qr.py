@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 
 import cbor2
-import qrcode
+import pyqrcode
 
 from . import base10
 from .constants import (
@@ -91,17 +91,50 @@ def build_fido_uri(handshake: HandshakeV2) -> str:
     return FIDO_URI_PREFIX + base10.encode(cbor_bytes)
 
 
+_QR_ASCII_BORDER = 2
+
+# Two-pixels-per-character half-block rendering, indexed by
+# `top_module + (bottom_module << 1)`: light/light, dark/light, light/dark,
+# dark/dark. `pyqrcode` has no built-in ASCII renderer, so we walk its raw
+# module matrix (`QRCode.code`, a list of 0/1 rows) ourselves -- mirroring
+# the approach `qrcode.QRCode.print_ascii` used to take.
+_QR_ASCII_BLOCKS = " ▀▄█"
+
+
 def render_qr_ascii(uri: str, *, out=None, invert: bool = False) -> None:
     """Render `uri` as an ASCII-art QR code to a stream (default: stdout)."""
     if out is None:
         out = sys.stdout
 
-    qr = qrcode.QRCode(border=2)
-    qr.add_data(uri)
-    qr.make(fit=True)
+    matrix = pyqrcode.create(uri).code
+    size = len(matrix)
+    border = _QR_ASCII_BORDER
 
     tty = bool(getattr(out, "isatty", lambda: False)())
-    qr.print_ascii(out=out, tty=tty, invert=invert)
+    if tty:
+        invert = True
+
+    blocks = _QR_ASCII_BLOCKS[::-1] if invert else _QR_ASCII_BLOCKS
+
+    def module(x: int, y: int) -> int:
+        # Beyond the rendered border, an inverted image's "background" is
+        # dark -- without this, the bottom/right edge of an inverted render
+        # would show a stray light fringe from the unpaired phantom row/col.
+        if invert and max(x, y) >= size + border:
+            return 1
+        if min(x, y) < 0 or max(x, y) >= size:
+            return 0
+        return matrix[x][y]
+
+    for row in range(-border, size + border, 2):
+        out.write(
+            "".join(
+                blocks[module(row, col) + (module(row + 1, col) << 1)]
+                for col in range(-border, size + border)
+            )
+        )
+        out.write("\n")
+    out.flush()
 
 
 __all__ = [

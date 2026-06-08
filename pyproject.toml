@@ -5,7 +5,7 @@ description = "Command-line FIDO client using hybrid transport (caBLE v2) to tal
 requires-python = ">=3.10"
 dependencies = [
     "cbor2",
-    "qrcode",
+    "pyqrcode",
     "cryptography",
     "websockets",
     "bleak",
