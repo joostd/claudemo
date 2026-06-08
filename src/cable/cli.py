@@ -81,13 +81,22 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     advert = parse_plaintext_eid(advert_plaintext)
     routing_id = advert["routing_id"]
     domain_id = advert["tunnel_server_id"]
+    _log(
+        f"Decrypted advertisement: nonce={advert['nonce'].hex()} "
+        f"routing_id={routing_id.hex().upper()} domain_id={domain_id} "
+        f"(plaintext={advert_plaintext.hex()})"
+    )
 
     tunnel_id = derive_tunnel_id(qr_secret)
+    _log(f"Derived tunnel_id={tunnel_id.hex().upper()} from qr_secret={qr_secret.hex()}")
     url = tunnel_url(domain_id, routing_id, tunnel_id)
 
     _log(f"Connecting to tunnel server ({url})...")
     tunnel = await TunnelConnection.connect(url)
-    _log("Connected. Starting Noise handshake...")
+    _log(
+        f"Connected (selected subprotocol={getattr(tunnel._websocket, 'subprotocol', None)!r}, "
+        f"routing-id header={tunnel.routing_id!r}). Starting Noise handshake..."
+    )
 
     def _log_noise_step(step, snapshot):
         _log(f"[noise:{step}] chaining_key={snapshot['chaining_key']} hash={snapshot['hash']}")
