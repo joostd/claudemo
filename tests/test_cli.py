@@ -9,8 +9,8 @@ def test_qr_command_runs_without_network():
 
     assert result.exit_code == 0
     assert "URI: FIDO:/" in result.output
-    # ASCII QR block characters should appear in the output.
-    assert any(ch in result.output for ch in "█▄▀")
+    # The terminal-rendered QR code is drawn with ANSI SGR escape sequences.
+    assert "\x1b[" in result.output
 
 
 def test_qr_command_accepts_request_type():

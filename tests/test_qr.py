@@ -83,5 +83,6 @@ def test_render_qr_ascii_smoke():
     output = buf.getvalue()
 
     assert output.strip()
-    # ASCII-art QR codes (non-tty path) are rendered with these block characters.
-    assert any(ch in output for ch in "█▄▀ ")
+    # `pyqrcode.QRCode.terminal()` renders modules as background-coloured
+    # spaces using ANSI SGR escape sequences -- e.g. "\x1b[7m  \x1b[0m".
+    assert "\x1b[" in output

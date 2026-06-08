@@ -65,8 +65,9 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   definition; encoder derived as its provable inverse).
 - `qr.py` -- `HandshakeV2` CBOR payload (33-byte compressed P-256
   `peer_identity`, 16-byte `secret`, integer list of `supported_transports`,
-  ...) + ASCII QR rendering, walking `pyqrcode`'s raw module matrix with a
-  half-block-character renderer (`pyqrcode` has no ASCII output of its own).
+  ...) + terminal QR rendering via `pyqrcode`'s `QRCode.terminal()`
+  (alphanumeric mode, error correction `L` -- `FIDO:/<digits>` URIs only ever
+  use the QR alphanumeric character set, so this yields the smallest code).
 - `crypto/kdf.py` -- HKDF-SHA256 derivations of session secrets from the QR
   secret (EID key, tunnel ID, PSK, ...), keyed by small-integer purpose codes
   (1/2/3/...) packed as 4-byte *little-endian* `info` (`DerivedValueType`).
