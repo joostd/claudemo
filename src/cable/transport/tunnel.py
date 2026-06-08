@@ -31,7 +31,11 @@ def tunnel_url(domain_id: int, routing_id: bytes, tunnel_id: bytes) -> str:
             "derivation for higher IDs is not implemented (its hashing "
             "scheme is not confirmed against any reference)."
         ) from exc
-    return f"wss://{domain}/cable/connect/{routing_id.hex()}/{tunnel_id.hex()}"
+    # Chromium's `GetConnectURL` builds this path with `base::HexEncode`,
+    # which produces *uppercase* hex digits (see v2_handshake.cc) -- both
+    # sides must compute byte-identical URLs for the tunnel server to pair
+    # them, so the case matters.
+    return f"wss://{domain}/cable/connect/{routing_id.hex().upper()}/{tunnel_id.hex().upper()}"
 
 
 class TunnelConnection:

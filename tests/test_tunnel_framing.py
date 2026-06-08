@@ -67,8 +67,11 @@ def test_extracts_routing_id_header():
 
 
 def test_tunnel_url_known_domain():
-    url = tunnel_url(0, b"\xaa" * 3, b"\x00" * 16)
-    assert url == "wss://cable.ua5v.com/cable/connect/" + ("aa" * 3) + "/" + ("00" * 16)
+    url = tunnel_url(0, b"\xab" * 3, b"\x00" * 16)
+    # Chromium's GetConnectURL hex-encodes with base::HexEncode, which is
+    # uppercase -- both sides must build byte-identical URLs to be paired
+    # by the tunnel server, so the case matters.
+    assert url == "wss://cable.ua5v.com/cable/connect/" + ("AB" * 3) + "/" + ("00" * 16)
 
 
 def test_tunnel_url_unknown_domain_raises():
