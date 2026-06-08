@@ -40,8 +40,12 @@ from ..constants import (
     NOISE_AEAD_TAG_SIZE,
     NOISE_DH_PUBLIC_KEY_SIZE,
     NOISE_HASH_SIZE,
+    NOISE_PROLOGUE_BYTE_INITIATOR_STATIC,
+    NOISE_PROLOGUE_BYTE_RESPONDER_STATIC,
     NOISE_PROTOCOL_KN,
     NOISE_PROTOCOL_NK,
+    QR_PEER_IDENTITY_SIZE,
+    TRANSPORT_PADDING_GRANULARITY,
 )
 
 # ---------------------------------------------------------------------------
@@ -64,13 +68,16 @@ HandshakeRole = str  # "initiator" or "responder"
 PATTERN_KN_PSK0 = {
     "name": NOISE_PROTOCOL_KN,
     # "KN": the initiator's static key is known to the responder ahead of
-    # time (sent as a pre-message, "K"); the responder has no static key at
-    # all ("N"). The canonical Noise_KN pattern is:
-    #   -> s          (pre-message)
-    #   -> e
+    # time ("K"); the responder has no static key at all ("N"). Per CTAP 2.3
+    # sctn-hybrid, this isn't modelled as a standard Noise pre-message --
+    # instead a caBLE-specific prologue mixes a single discriminator byte
+    # (1 = "the initiator's key is the pre-shared one") followed by that
+    # static key (see `_apply_prologue`). The message token sequence is then
+    # the canonical Noise_KN pattern with `psk0` prefixing the first message:
+    #   -> e               (preceded by "psk")
     #   <- e, ee, se
-    # `psk0` prefixes the very first message with a "psk" token.
-    "pre_messages": {"initiator": ["s"], "responder": []},
+    "prologue_owner": "initiator",
+    "prologue_byte": NOISE_PROLOGUE_BYTE_INITIATOR_STATIC,
     "messages": [
         {"sender": "initiator", "tokens": ["psk", "e"]},
         {"sender": "responder", "tokens": ["e", "ee", "se"]},
@@ -79,7 +86,12 @@ PATTERN_KN_PSK0 = {
 
 PATTERN_NK_PSK0 = {
     "name": NOISE_PROTOCOL_NK,
-    "pre_messages": {"initiator": [], "responder": ["s"]},
+    # "NK": the responder's static key is known to the initiator ahead of
+    # time ("K" from the responder's perspective); the initiator has none
+    # ("N"). Prologue discriminator byte 0 = "the responder's key is the
+    # pre-shared one", followed by that static key.
+    "prologue_owner": "responder",
+    "prologue_byte": NOISE_PROLOGUE_BYTE_RESPONDER_STATIC,
     "messages": [
         {"sender": "initiator", "tokens": ["psk", "e", "es"]},
         {"sender": "responder", "tokens": ["e", "ee"]},
@@ -130,6 +142,28 @@ def deserialize_public_key(data: bytes) -> ec.EllipticCurvePublicKey:
     return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), data)
 
 
+def serialize_public_key_compressed(public_key: ec.EllipticCurvePublicKey) -> bytes:
+    """Encode a P-256 public key as a 33-byte X9.62 compressed point.
+
+    This is the encoding the QR code's `peer_identity` field requires (CTAP
+    2.3 sctn-hybrid Key 0) -- distinct from the 65-byte uncompressed points
+    used inside the Noise handshake itself.
+    """
+    encoded = public_key.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.CompressedPoint,
+    )
+    if len(encoded) != QR_PEER_IDENTITY_SIZE:
+        raise ValueError(f"unexpected compressed P-256 public key length: {len(encoded)}")
+    return encoded
+
+
+def deserialize_public_key_compressed(data: bytes) -> ec.EllipticCurvePublicKey:
+    if len(data) != QR_PEER_IDENTITY_SIZE:
+        raise ValueError(f"compressed P-256 public key must be {QR_PEER_IDENTITY_SIZE} bytes, got {len(data)}")
+    return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), data)
+
+
 def dh(private_key: ec.EllipticCurvePrivateKey, public_key_bytes: bytes) -> bytes:
     """Perform ECDH and return the raw shared X-coordinate as Noise expects."""
     peer_public_key = deserialize_public_key(public_key_bytes)
@@ -168,6 +202,31 @@ def _hmac(key: bytes, data: bytes) -> bytes:
     return _hmac_mod.new(key, data, "sha256").digest()
 
 
+def pad_message(plaintext: bytes, *, granularity: int = TRANSPORT_PADDING_GRANULARITY) -> bytes:
+    """Pad a transport plaintext per CTAP 2.3 sctn-hybrid before encryption.
+
+    The message is padded out to a multiple of `granularity` bytes; the
+    final byte records how many padding bytes precede it, minus one (so that
+    at least one padding byte -- the length marker itself -- is always
+    present, even for already-aligned inputs).
+    """
+    extra = granularity - (len(plaintext) % granularity)
+    padded = bytearray(plaintext)
+    padded += bytes(extra - 1)
+    padded.append(extra - 1)
+    return bytes(padded)
+
+
+def unpad_message(padded: bytes) -> bytes:
+    """Inverse of `pad_message`; raises `ValueError` on malformed padding."""
+    if not padded:
+        raise ValueError("cannot unpad an empty message")
+    padding_length = padded[-1]
+    if padding_length + 1 > len(padded):
+        raise ValueError("invalid padding: padding length exceeds message size")
+    return padded[: len(padded) - 1 - padding_length]
+
+
 @dataclass
 class CipherState:
     key: bytes | None = None
@@ -181,10 +240,12 @@ class CipherState:
         return self.key is not None
 
     def _nonce_bytes(self) -> bytes:
-        # Noise nonces are 64-bit little-endian counters placed in the low
-        # bits of a 96-bit (12-byte) AEAD nonce, per the spec's AESGCM
-        # convention (4 zero bytes followed by the 8-byte LE counter).
-        nonce = b"\x00\x00\x00\x00" + self.nonce.to_bytes(8, "little")
+        # CTAP 2.3 sctn-hybrid: nonces are per-direction counters, big-endian
+        # encoded into the low-order 4 bytes of the 12-byte AEAD nonce (the
+        # high-order 8 bytes are zero). This is *not* the generic Noise
+        # convention (64-bit LE counter in the low bytes) -- it's specific to
+        # caBLE's post-handshake transport encryption.
+        nonce = b"\x00\x00\x00\x00\x00\x00\x00\x00" + self.nonce.to_bytes(4, "big")
         assert len(nonce) == NOISE_AEAD_NONCE_SIZE
         return nonce
 
@@ -304,25 +365,29 @@ class NoiseHandshake:
         self.remote_ephemeral_public: bytes | None = None
 
         self._message_index = 0
-        self._apply_pre_messages()
+        self._apply_prologue()
 
     # -- setup -------------------------------------------------------------
 
-    def _apply_pre_messages(self) -> None:
-        peer_role = "responder" if self.role == "initiator" else "initiator"
-        for owner_role in ("initiator", "responder"):
-            for token in self.pattern["pre_messages"].get(owner_role, []):
-                if token != "s":
-                    raise ValueError(f"unsupported pre-message token: {token!r}")
-                if owner_role == self.role:
-                    if self.local_static is None:
-                        raise ValueError("pattern requires a local static key that was not provided")
-                    self.symmetric.mix_hash(self.local_static.public_bytes)
-                elif owner_role == peer_role:
-                    if self.remote_static_public is None:
-                        raise ValueError("pattern requires a remote static key that was not provided")
-                    self.symmetric.mix_hash(self.remote_static_public)
-        self.debug_log("pre_messages", self._snapshot())
+    def _apply_prologue(self) -> None:
+        """Mix in the caBLE-specific prologue (CTAP 2.3 sctn-hybrid).
+
+        Unlike standard Noise pre-messages, this is a single discriminator
+        byte -- identifying which side's static key was pre-shared via the
+        QR code -- followed by `mix_hash` (not `mix_key`) of that static key:
+        `ns.mixHash([]byte{0 or 1}); ns.mixHashPoint(...)`.
+        """
+        owner = self.pattern["prologue_owner"]
+        self.symmetric.mix_hash(bytes([self.pattern["prologue_byte"]]))
+        if owner == self.role:
+            if self.local_static is None:
+                raise ValueError("pattern requires a local static key that was not provided")
+            self.symmetric.mix_hash(self.local_static.public_bytes)
+        else:
+            if self.remote_static_public is None:
+                raise ValueError("pattern requires a remote static key that was not provided")
+            self.symmetric.mix_hash(self.remote_static_public)
+        self.debug_log("prologue", self._snapshot())
 
     def _snapshot(self) -> dict:
         return {
@@ -386,7 +451,12 @@ class NoiseHandshake:
         if token == "e":
             if self.local_ephemeral is None:
                 self.local_ephemeral = generate_keypair()
+            # caBLE deviates from standard Noise here: the "e" token mixes
+            # the raw ephemeral public-key bytes into *both* the hash and
+            # the chaining key (`ns.mixHash(...); ns.mixKey(...)`), not just
+            # the hash as plain Noise's WriteMessage does.
             self.symmetric.mix_hash(self.local_ephemeral.public_bytes)
+            self.symmetric.mix_key(self.local_ephemeral.public_bytes)
             return self.local_ephemeral.public_bytes
         if token == "s":
             if self.local_static is None:
@@ -407,6 +477,7 @@ class NoiseHandshake:
                 raise ValueError("truncated handshake message: missing ephemeral public key")
             self.remote_ephemeral_public = key_bytes
             self.symmetric.mix_hash(key_bytes)
+            self.symmetric.mix_key(key_bytes)
             return offset + NOISE_DH_PUBLIC_KEY_SIZE
         if token == "s":
             has_key = self.symmetric.cipher.has_key()
@@ -469,7 +540,11 @@ __all__ = [
     "keypair_from_private_bytes",
     "serialize_public_key",
     "deserialize_public_key",
+    "serialize_public_key_compressed",
+    "deserialize_public_key_compressed",
     "dh",
+    "pad_message",
+    "unpad_message",
     "CipherState",
     "SymmetricState",
     "HandshakeResult",

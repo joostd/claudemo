@@ -1,20 +1,24 @@
 """Command-line entry point: orchestrates the full hybrid-transport flow.
 
-    1. Generate an ephemeral P-256 keypair and a random 16-byte QR secret.
+    1. Generate an ephemeral identity keypair and a random 16-byte QR secret.
     2. Build and display the `FIDO:/...` QR code as ASCII art.
-    3. Connect to the tunnel server and run the Noise handshake.
-    4. (best-effort, non-blocking) scan for the phone's BLE advertisement.
-    5. Wrap the resulting encrypted channel in a `CtapHybridDevice` and
+    3. Wait for the phone's BLE advertisement -- a *hard prerequisite* of the
+       QR-initiated flow (CTAP 2.3 sctn-hybrid): it is the only source of the
+       routing ID (needed to address the tunnel) and the Noise PSK salt.
+    4. Connect to the tunnel server (addressed via that routing ID) and run
+       the Noise handshake, salted with the decrypted advertisement.
+    5. Read the mandatory post-handshake message (cached `getInfo` response).
+    6. Wrap the resulting encrypted channel in a `CtapHybridDevice` and
        drive it with `fido2.ctap2.Ctap2` to perform the requested operation.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import secrets
 import time
 
+import cbor2
 import click
 
 from . import qr
@@ -23,27 +27,33 @@ from .constants import (
     REQUEST_TYPE_MAKE_CREDENTIAL,
 )
 from .crypto import noise
-from .crypto.kdf import derive_psk, derive_tunnel_id
+from .crypto.eid import parse_plaintext_eid
+from .crypto.kdf import derive_eid_key, derive_psk, derive_tunnel_id
 from .device import CtapHybridDevice, _BackgroundLoop
 from .transport import ble
+from .transport.channel import CableChannel
 from .transport.tunnel import TunnelConnection, tunnel_url
-
-DEFAULT_TUNNEL_DOMAIN_ID = 0  # cable.ua5v.com (Google)
 
 
 def _log(message: str) -> None:
     click.echo(click.style("==> ", fg="cyan", bold=True) + message, err=True)
 
 
-async def _connect_and_handshake(
-    *, request_type: str, domain_id: int, debug_noise: bool, no_ble: bool
-):
-    """Run steps 2-4 of the flow; returns (tunnel, handshake_result)."""
+async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
+    """Run the QR-initiated connection flow end to end (CTAP 2.3 sctn-hybrid).
+
+    Returns `(channel, handshake_result)`. Unlike a "best-effort proximity
+    check", BLE advertisement reception is a *hard prerequisite* here: the
+    decrypted advertisement supplies both the routing ID (to address the
+    tunnel) and the salt for the Noise PSK, so nothing else can proceed
+    without it.
+    """
     qr_secret = secrets.token_bytes(16)
     keypair = noise.generate_keypair()
+    peer_identity = noise.serialize_public_key_compressed(keypair.private_key.public_key())
 
     handshake = qr.HandshakeV2(
-        peer_identity=keypair.public_bytes,
+        peer_identity=peer_identity,
         secret=qr_secret,
         timestamp=int(time.time()),
         request_type=request_type,
@@ -57,47 +67,52 @@ async def _connect_and_handshake(
     _log(f"URI: {uri}")
     click.echo()
 
-    ble_task = None
-    if not no_ble:
-        from .crypto.kdf import derive_eid_key
+    eid_key = derive_eid_key(qr_secret)
+    _log("Waiting for the phone's BLE advertisement (carries the routing ID and proves proximity)...")
+    advert_plaintext = await ble.scan_for_eid(eid_key)
+    if advert_plaintext is None:
+        raise RuntimeError(
+            "no matching BLE advertisement was seen. The QR-initiated hybrid "
+            "flow cannot proceed without one -- it is the only source of the "
+            "routing ID and the Noise PSK salt (see CTAP 2.3 sctn-hybrid)."
+        )
+    _log("BLE advertisement received and verified ✓")
 
-        _log("Listening for the phone's BLE advertisement (best-effort proximity check)...")
-        ble_task = asyncio.ensure_future(ble.scan_for_eid(derive_eid_key(qr_secret)))
+    advert = parse_plaintext_eid(advert_plaintext)
+    routing_id = advert["routing_id"]
+    domain_id = advert["tunnel_server_id"]
 
     tunnel_id = derive_tunnel_id(qr_secret)
-    url = tunnel_url(domain_id, tunnel_id)
+    url = tunnel_url(domain_id, routing_id, tunnel_id)
 
     _log(f"Connecting to tunnel server ({url})...")
     tunnel = await TunnelConnection.connect(url)
-    _log("Connected. Waiting for phone to join and starting Noise handshake...")
+    _log("Connected. Starting Noise handshake...")
 
     def _log_noise_step(step, snapshot):
         _log(f"[noise:{step}] chaining_key={snapshot['chaining_key']} hash={snapshot['hash']}")
 
     debug_log = _log_noise_step if debug_noise else None
 
-    # The PSK is salted with the (as-yet-unknown) EID in the reference
-    # implementation; for the QR-initiated flow without a confirmed BLE
-    # advertisement we fall back to deriving it salted with the QR secret
-    # alone. This is one of the documented points of protocol uncertainty
-    # (see crypto/noise.py and CLAUDE.md) -- adjust here if real-device
-    # testing shows the phone expects EID-salted PSK derivation instead.
-    psk = derive_psk(qr_secret, eid=b"")
+    # The PSK is salted with the full 16-byte decrypted BLE advertisement
+    # (CTAP 2.3 sctn-hybrid: "The full BLE advert is included in the PSK
+    # derivation to ensure that any future additions to the advert format
+    # are automatically authenticated").
+    psk = derive_psk(qr_secret, eid=advert_plaintext)
 
     handshake_state = noise.NoiseHandshake(
         pattern=noise.PATTERN_KN_PSK0,
         role="initiator",
         local_static=keypair,
-        local_ephemeral=keypair,
         psk=psk,
         debug_log=debug_log,
     )
 
     first_message = handshake_state.write_message()
-    await tunnel.send_message(0x01, first_message)
+    await tunnel.send(first_message)
 
-    response = await tunnel.recv_message()
-    handshake_state.read_message(response.payload)
+    response = await tunnel.recv()
+    handshake_state.read_message(response)
 
     if not handshake_state.is_complete():
         raise RuntimeError(
@@ -109,14 +124,21 @@ async def _connect_and_handshake(
     result = handshake_state.finish()
     _log("Noise handshake complete; tunnel is now end-to-end encrypted.")
 
-    if ble_task is not None:
-        if ble_task.done() and ble_task.result() is not None:
-            _log("BLE proximity check: matching advertisement seen ✓")
-        else:
-            ble_task.cancel()
-            _log("BLE proximity check: no matching advertisement seen (continuing anyway)")
+    channel = CableChannel(tunnel, send_cipher=result.send_cipher, receive_cipher=result.receive_cipher)
 
-    return tunnel, result
+    # The authenticator's first message is a bare (non-type-byte-framed) CBOR
+    # map carrying its cached authenticatorGetInfo response, sent to save a
+    # round trip. We must read and validate it before any typed CTAP exchange
+    # begins, or the channel will desync from the authenticator's framing.
+    post_handshake = cbor2.loads(await channel.recv_post_handshake())
+    if not isinstance(post_handshake, dict) or post_handshake.get(1) is None:
+        raise RuntimeError(
+            "post-handshake message did not contain a cached authenticatorGetInfo "
+            "response (CBOR map key 1) -- protocol framing mismatch."
+        )
+    _log("Received post-handshake message (cached authenticatorGetInfo response).")
+
+    return channel, result
 
 
 def _client_data_hash(challenge: bytes) -> bytes:
@@ -135,7 +157,7 @@ def show_qr(request_type: str) -> None:
     qr_secret = secrets.token_bytes(16)
     keypair = noise.generate_keypair()
     handshake = qr.HandshakeV2(
-        peer_identity=keypair.public_bytes,
+        peer_identity=noise.serialize_public_key_compressed(keypair.private_key.public_key()),
         secret=qr_secret,
         timestamp=int(time.time()),
         request_type=request_type,
@@ -148,15 +170,11 @@ def show_qr(request_type: str) -> None:
 
 
 @main.command("get-info")
-@click.option("--domain-id", type=int, default=DEFAULT_TUNNEL_DOMAIN_ID)
-@click.option("--no-ble", is_flag=True, help="Skip the BLE proximity check.")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
-def get_info(domain_id: int, no_ble: bool, debug_noise: bool) -> None:
+def get_info(debug_noise: bool) -> None:
     """Connect to a phone and print its authenticatorGetInfo response."""
     _run_session(
         request_type=REQUEST_TYPE_GET_ASSERTION,
-        domain_id=domain_id,
-        no_ble=no_ble,
         debug_noise=debug_noise,
         action=lambda ctap2: click.echo(ctap2.info),
     )
@@ -165,10 +183,8 @@ def get_info(domain_id: int, no_ble: bool, debug_noise: bool) -> None:
 @main.command("get-assertion")
 @click.option("--rp-id", required=True)
 @click.option("--challenge", required=True, help="Challenge string (will be SHA-256 hashed).")
-@click.option("--domain-id", type=int, default=DEFAULT_TUNNEL_DOMAIN_ID)
-@click.option("--no-ble", is_flag=True, help="Skip the BLE proximity check.")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
-def get_assertion(rp_id: str, challenge: str, domain_id: int, no_ble: bool, debug_noise: bool) -> None:
+def get_assertion(rp_id: str, challenge: str, debug_noise: bool) -> None:
     """Request a CTAP2 GetAssertion from the phone."""
 
     def action(ctap2):
@@ -177,8 +193,6 @@ def get_assertion(rp_id: str, challenge: str, domain_id: int, no_ble: bool, debu
 
     _run_session(
         request_type=REQUEST_TYPE_GET_ASSERTION,
-        domain_id=domain_id,
-        no_ble=no_ble,
         debug_noise=debug_noise,
         action=action,
     )
@@ -190,8 +204,6 @@ def get_assertion(rp_id: str, challenge: str, domain_id: int, no_ble: bool, debu
 @click.option("--user-id", required=True, help="User ID string (will be UTF-8 encoded).")
 @click.option("--user-name", required=True)
 @click.option("--challenge", required=True, help="Challenge string (will be SHA-256 hashed).")
-@click.option("--domain-id", type=int, default=DEFAULT_TUNNEL_DOMAIN_ID)
-@click.option("--no-ble", is_flag=True, help="Skip the BLE proximity check.")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
 def make_credential(
     rp_id: str,
@@ -199,8 +211,6 @@ def make_credential(
     user_id: str,
     user_name: str,
     challenge: str,
-    domain_id: int,
-    no_ble: bool,
     debug_noise: bool,
 ) -> None:
     """Request a CTAP2 MakeCredential from the phone."""
@@ -216,14 +226,12 @@ def make_credential(
 
     _run_session(
         request_type=REQUEST_TYPE_MAKE_CREDENTIAL,
-        domain_id=domain_id,
-        no_ble=no_ble,
         debug_noise=debug_noise,
         action=action,
     )
 
 
-def _run_session(*, request_type, domain_id, no_ble, debug_noise, action) -> None:
+def _run_session(*, request_type, debug_noise, action) -> None:
     from fido2.ctap import CtapError
     from fido2.ctap2.base import Ctap2
     from websockets.exceptions import WebSocketException
@@ -232,21 +240,14 @@ def _run_session(*, request_type, domain_id, no_ble, debug_noise, action) -> Non
     device = None
     try:
         try:
-            tunnel, result = loop.run(
+            channel, _result = loop.run(
                 _connect_and_handshake(
                     request_type=request_type,
-                    domain_id=domain_id,
                     debug_noise=debug_noise,
-                    no_ble=no_ble,
                 )
             )
 
-            device = CtapHybridDevice(
-                tunnel,
-                send_cipher=result.send_cipher,
-                receive_cipher=result.receive_cipher,
-                background_loop=loop,
-            )
+            device = CtapHybridDevice(channel, background_loop=loop)
             ctap2 = Ctap2(device)
             action(ctap2)
         except (OSError, WebSocketException) as exc:

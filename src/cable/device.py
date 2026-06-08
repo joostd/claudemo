@@ -1,4 +1,4 @@
-"""Bridge from the encrypted caBLE tunnel to `python-fido2`'s CTAP2 layer.
+"""Bridge from the encrypted caBLE channel to `python-fido2`'s CTAP2 layer.
 
 `fido2.ctap2.base.Ctap2` implements all CTAP2 command construction/response
 parsing (GetInfo, MakeCredential, GetAssertion, error translation, ...) on
@@ -11,12 +11,13 @@ Concretely, `Ctap2.send_cbor` builds `request = bytes([subcommand]) +
 cbor.encode(args)`, calls `device.call(CTAPHID.CBOR, request, ...)`, and
 expects back `bytes([status]) + cbor.encode(response)`.
 
-`CtapHybridDevice` below is a thin adapter: it Noise-encrypts the opaque
-`data` blob, frames it as a caBLE `CTAP` (0x01) tunnel message, sends it,
-waits for the encrypted response frame, decrypts it, and hands the raw bytes
+`CtapHybridDevice` below is a thin adapter over a `CableChannel`
+(`transport.channel`, which already handles Noise encryption, padding, and
+type-byte framing): it sends the opaque `data` blob as a `CTAP` (0x01)
+message, waits for the matching response message, and hands the raw payload
 back -- letting `Ctap2` handle everything else. The only nontrivial part is
-bridging the synchronous `call()` interface to the underlying async
-WebSocket tunnel, done here via a dedicated background event-loop thread.
+bridging the synchronous `call()` interface to the underlying async channel,
+done here via a dedicated background event-loop thread.
 """
 
 from __future__ import annotations
@@ -29,8 +30,7 @@ from fido2.ctap import CtapDevice, CtapError
 from fido2.hid import CAPABILITY, CTAPHID
 
 from .constants import CableFrameType
-from .crypto.noise import CipherState
-from .transport.tunnel import TunnelConnection
+from .transport.channel import CableChannel
 
 # Generous default: several phone-side flows (user presence, biometric
 # prompts, ...) can take a while, and unlike USB/NFC there is no caBLE-tunnel
@@ -61,20 +61,16 @@ class _BackgroundLoop:
 
 
 class CtapHybridDevice(CtapDevice):
-    """A `CtapDevice` that transports CTAP2 over an encrypted caBLE tunnel."""
+    """A `CtapDevice` that transports CTAP2 over an encrypted caBLE channel."""
 
     def __init__(
         self,
-        tunnel: TunnelConnection,
-        send_cipher: CipherState,
-        receive_cipher: CipherState,
+        channel: CableChannel,
         *,
         call_timeout: float = DEFAULT_CALL_TIMEOUT,
         background_loop: "_BackgroundLoop | None" = None,
     ) -> None:
-        self._tunnel = tunnel
-        self._send_cipher = send_cipher
-        self._receive_cipher = receive_cipher
+        self._channel = channel
         self._call_timeout = call_timeout
         self._owns_loop = background_loop is None
         self._loop = background_loop or _BackgroundLoop()
@@ -109,14 +105,13 @@ class CtapHybridDevice(CtapDevice):
             raise CtapError(CtapError.ERR.TIMEOUT) from exc
 
     async def _call_async(self, data: bytes, event: "threading.Event | None") -> bytes:
-        ciphertext = self._send_cipher.encrypt_with_ad(b"", data)
-        await self._tunnel.send_message(CableFrameType.CTAP, ciphertext)
+        await self._channel.send_message(CableFrameType.CTAP, data)
 
         while True:
             if event is not None and event.is_set():
                 raise CtapError(CtapError.ERR.KEEPALIVE_CANCEL)
 
-            recv_task = asyncio.ensure_future(self._tunnel.recv_message())
+            recv_task = asyncio.ensure_future(self._channel.recv_message())
             try:
                 message = await asyncio.wait_for(asyncio.shield(recv_task), timeout=1.0)
             except asyncio.TimeoutError:
@@ -129,7 +124,7 @@ class CtapHybridDevice(CtapDevice):
                 # actual CTAP response.
                 continue
 
-            return self._receive_cipher.decrypt_with_ad(b"", message.payload)
+            return message.payload
 
     @classmethod
     def list_devices(cls) -> Iterator["CtapHybridDevice"]:
@@ -142,11 +137,11 @@ class CtapHybridDevice(CtapDevice):
             return
         self._closed = True
         try:
-            self._loop.run(self._tunnel.send_shutdown(), timeout=5.0)
+            self._loop.run(self._channel.send_message(CableFrameType.SHUTDOWN), timeout=5.0)
         except Exception:
             pass
         try:
-            self._loop.run(self._tunnel.close(), timeout=5.0)
+            self._loop.run(self._channel.close(), timeout=5.0)
         except Exception:
             pass
         if self._owns_loop:

@@ -1,28 +1,27 @@
-"""WebSocket connection to a caBLE tunnel server, with caBLE message framing.
+"""Raw WebSocket connection to a caBLE tunnel server.
 
 Once a phone scans the QR code, it connects to a "tunnel server" -- a
 WebSocket relay -- and the desktop connects to the same server/routing
-address. All subsequent traffic (the Noise handshake, then encrypted CTAP2
-commands) flows as binary WebSocket frames, each prefixed with a single
-"message type" byte (see `constants.CableFrameType`).
+address. The tunnel itself is a dumb byte pipe: every binary WebSocket frame
+is either a Noise handshake message or (after the handshake) an encrypted,
+padded, type-byte-framed application message -- see `transport.channel` for
+that layer. `TunnelConnection` only handles the raw frame plumbing.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import websockets
 
-from ..constants import (
-    CableFrameType,
-    KNOWN_TUNNEL_DOMAINS,
-    TUNNEL_ROUTING_ID_HEADER,
-    TUNNEL_SUBPROTOCOL,
-)
+from ..constants import KNOWN_TUNNEL_DOMAINS, TUNNEL_ROUTING_ID_HEADER, TUNNEL_SUBPROTOCOL
 
 
-def tunnel_url(domain_id: int, tunnel_id: bytes) -> str:
-    """Build the tunnel server WebSocket URL for a known domain + tunnel ID."""
+def tunnel_url(domain_id: int, routing_id: bytes, tunnel_id: bytes) -> str:
+    """Build the tunnel server WebSocket URL for a QR-initiated connection.
+
+    Per CTAP 2.3 sctn-hybrid, the path is `/cable/connect/<routing id
+    (hex)>/<tunnel id (hex)>`; the routing ID comes from the decrypted BLE
+    advertisement (it cannot be known before that advertisement is seen).
+    """
     try:
         domain = KNOWN_TUNNEL_DOMAINS[domain_id]
     except KeyError as exc:
@@ -32,17 +31,18 @@ def tunnel_url(domain_id: int, tunnel_id: bytes) -> str:
             "derivation for higher IDs is not implemented (its hashing "
             "scheme is not confirmed against any reference)."
         ) from exc
-    return f"wss://{domain}/cable/connect/{tunnel_id.hex()}"
-
-
-@dataclass
-class TunnelMessage:
-    frame_type: int
-    payload: bytes
+    return f"wss://{domain}/cable/connect/{routing_id.hex()}/{tunnel_id.hex()}"
 
 
 class TunnelConnection:
-    """Async context manager wrapping a caBLE tunnel server WebSocket."""
+    """Async context manager wrapping a caBLE tunnel server WebSocket.
+
+    Exposes only raw binary-frame send/receive: the spec requires "messages
+    are exchanged in binary WebSocket frames and no other frame types are
+    permitted on the connection," with no tunnel-level framing of its own --
+    all higher-level structure (Noise handshake messages, then encrypted
+    type-byte-framed application messages) lives in the frame payloads.
+    """
 
     def __init__(self, websocket) -> None:
         self._websocket = websocket
@@ -74,19 +74,14 @@ class TunnelConnection:
     async def close(self) -> None:
         await self._websocket.close()
 
-    async def send_message(self, frame_type: int, payload: bytes = b"") -> None:
-        await self._websocket.send(bytes([frame_type]) + payload)
+    async def send(self, data: bytes) -> None:
+        await self._websocket.send(data)
 
-    async def recv_message(self) -> TunnelMessage:
+    async def recv(self) -> bytes:
         frame = await self._websocket.recv()
         if isinstance(frame, str):
             frame = frame.encode("utf-8")
-        if not frame:
-            raise ValueError("received empty tunnel frame (missing message-type byte)")
-        return TunnelMessage(frame_type=frame[0], payload=frame[1:])
-
-    async def send_shutdown(self) -> None:
-        await self.send_message(CableFrameType.SHUTDOWN)
+        return frame
 
 
-__all__ = ["TunnelConnection", "TunnelMessage", "tunnel_url"]
+__all__ = ["TunnelConnection", "tunnel_url"]

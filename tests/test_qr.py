@@ -8,13 +8,16 @@ from cable.constants import (
     HANDSHAKE_FIELD_PEER_IDENTITY,
     HANDSHAKE_FIELD_REQUEST_TYPE,
     HANDSHAKE_FIELD_SECRET,
+    HANDSHAKE_FIELD_SUPPORTED_TRANSPORTS,
+    QR_PEER_IDENTITY_SIZE,
     QR_SECRET_SIZE,
+    TRANSPORT_CHANNEL_WEBSOCKET,
 )
 
 
 def _sample_handshake():
     return qr.HandshakeV2(
-        peer_identity=b"\x04" + b"\x01" * 64,  # plausible uncompressed P-256 point shape
+        peer_identity=b"\x02" + b"\x01" * (QR_PEER_IDENTITY_SIZE - 1),  # plausible compressed P-256 point shape
         secret=b"\x02" * QR_SECRET_SIZE,
         timestamp=1_700_000_000,
         request_type="ga",
@@ -25,7 +28,19 @@ def test_handshake_rejects_bad_secret_size():
     import pytest
 
     with pytest.raises(ValueError):
-        qr.HandshakeV2(peer_identity=b"\x04", secret=b"\x00" * 5)
+        qr.HandshakeV2(peer_identity=b"\x02" + b"\x00" * 32, secret=b"\x00" * 5)
+
+
+def test_handshake_rejects_bad_peer_identity_size():
+    import pytest
+
+    with pytest.raises(ValueError):
+        qr.HandshakeV2(peer_identity=b"\x04" + b"\x00" * 64, secret=b"\x00" * QR_SECRET_SIZE)
+
+
+def test_handshake_default_supported_transports_is_websocket_only():
+    handshake = _sample_handshake()
+    assert handshake.supported_transports == [TRANSPORT_CHANNEL_WEBSOCKET]
 
 
 def test_encode_handshake_cbor_shape():
@@ -37,8 +52,10 @@ def test_encode_handshake_cbor_shape():
     assert decoded[HANDSHAKE_FIELD_PEER_IDENTITY] == handshake.peer_identity
     assert decoded[HANDSHAKE_FIELD_SECRET] == handshake.secret
     assert decoded[HANDSHAKE_FIELD_REQUEST_TYPE] == "ga"
+    assert decoded[HANDSHAKE_FIELD_SUPPORTED_TRANSPORTS] == handshake.supported_transports
     assert isinstance(decoded[HANDSHAKE_FIELD_PEER_IDENTITY], bytes)
     assert isinstance(decoded[HANDSHAKE_FIELD_SECRET], bytes)
+    assert isinstance(decoded[HANDSHAKE_FIELD_SUPPORTED_TRANSPORTS], list)
 
 
 def test_encode_decode_handshake_round_trip():

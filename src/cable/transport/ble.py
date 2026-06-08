@@ -1,16 +1,20 @@
-"""Best-effort BLE proximity check for hybrid transport.
+"""BLE advertisement scanning for the QR-initiated hybrid-transport flow.
 
 A phone authenticator broadcasts a BLE advertisement carrying an Encrypted
 Identifier (EID, see `crypto.eid`) that a nearby desktop can recognize using
-key material derived from the QR secret. This is a *proximity confirmation*,
-not a requirement for the tunnel connection to work -- the phone can (and,
-per Chromium's behaviour, generally does) connect to the tunnel server
-regardless of whether the desktop ever sees its BLE advert.
+key material derived from the QR secret. Per CTAP 2.3 sctn-hybrid this is
+*not* a mere proximity nicety: receiving and decrypting it is the **only**
+way the desktop learns the routing ID (needed to address the tunnel) and
+the connection nonce (the full plaintext salts the Noise PSK), so the
+QR-initiated flow cannot proceed without it -- callers should treat a `None`
+result as a hard failure, not "proceed anyway".
 
-Accordingly, every failure mode here (no BLE adapter, missing OS permissions,
-scan timeout, no matching advertisement) is treated as "proceed without
-proximity confirmation" rather than a hard error -- callers get `None` and
-should carry on with the tunnel-based flow.
+`scan_for_eid` itself stays resilient at the *mechanism* level: anything that
+prevents scanning from running at all (no BLE adapter, missing OS
+permissions, `bleak` not installed, an unexpected scanner error) resolves to
+`None` rather than raising, just like an ordinary scan timeout with no
+matching advertisement -- the caller is responsible for deciding what `None`
+means for the flow it's driving.
 """
 
 from __future__ import annotations

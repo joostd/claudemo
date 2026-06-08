@@ -7,9 +7,12 @@ from cable.crypto import kdf
 
 
 def test_info_bytes_are_little_endian():
-    assert derived_value_info_bytes(DerivedValueType.EID_KEY) == bytes([0x00, 0x00, 0x00, 0x01])
-    assert derived_value_info_bytes(DerivedValueType.TUNNEL_ID) == bytes([0x00, 0x00, 0x00, 0x02])
-    assert derived_value_info_bytes(DerivedValueType.PSK) == bytes([0x00, 0x00, 0x00, 0x03])
+    # CTAP 2.3 sctn-hybrid: `purpose32[0] = byte(purpose)`, the rest zero --
+    # i.e. the small purpose integer (1/2/3/...) packed as 4 little-endian
+    # bytes, NOT the byte sequence read as a big-endian hex literal.
+    assert derived_value_info_bytes(DerivedValueType.EID_KEY) == bytes([0x01, 0x00, 0x00, 0x00])
+    assert derived_value_info_bytes(DerivedValueType.TUNNEL_ID) == bytes([0x02, 0x00, 0x00, 0x00])
+    assert derived_value_info_bytes(DerivedValueType.PSK) == bytes([0x03, 0x00, 0x00, 0x00])
     # Round trip through struct to be doubly sure about endianness.
     assert struct.unpack("<I", derived_value_info_bytes(DerivedValueType.EID_KEY))[0] == DerivedValueType.EID_KEY
 

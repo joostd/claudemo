@@ -23,14 +23,19 @@ HANDSHAKE_FIELD_PEER_IDENTITY = 0  # bytes: ephemeral P-256 public key (compress
 HANDSHAKE_FIELD_SECRET = 1  # bytes: 16 random "QR secret" bytes
 HANDSHAKE_FIELD_KNOWN_DOMAINS_COUNT = 2  # uint: number of known tunnel server domains
 HANDSHAKE_FIELD_TIMESTAMP = 3  # uint: unix seconds, used for replay protection
-HANDSHAKE_FIELD_SUPPORTS_LINKING_INFO = 4  # bool
+HANDSHAKE_FIELD_SUPPORTS_LINKING_INFO = 4  # bool: can perform state-assisted transactions
 HANDSHAKE_FIELD_REQUEST_TYPE = 5  # text: "ga" (GetAssertion) or "mc" (MakeCredential)
-HANDSHAKE_FIELD_SUPPORTS_NON_DISCOVERABLE_MC = 6  # bool
+HANDSHAKE_FIELD_SUPPORTED_TRANSPORTS = 6  # array of ints: supported data-transfer channels
 
 REQUEST_TYPE_GET_ASSERTION = "ga"
 REQUEST_TYPE_MAKE_CREDENTIAL = "mc"
 
+# Values for HANDSHAKE_FIELD_SUPPORTED_TRANSPORTS (CTAP 2.3 sctn-hybrid).
+TRANSPORT_CHANNEL_WEBSOCKET = 0
+TRANSPORT_CHANNEL_BLE = 1
+
 QR_SECRET_SIZE = 16  # bytes
+QR_PEER_IDENTITY_SIZE = 33  # compressed X9.62 P-256 public key, per CTAP 2.3 sctn-hybrid
 
 # --- base10 encoding chunk table --------------------------------------------
 #
@@ -69,26 +74,40 @@ NOISE_PROTOCOL_NK = b"Noise_NKpsk0_P256_AESGCM_SHA256\0"
 assert len(NOISE_PROTOCOL_KN) == 32
 assert len(NOISE_PROTOCOL_NK) == 32
 
+# Each handshake is preceded by a caBLE-specific "prologue" that mixes a
+# single discriminator byte -- identifying which side's static key is being
+# pre-shared -- followed by that static key itself (CTAP 2.3 sctn-hybrid:
+# `ns.mixHash([]byte{0 or 1}); ns.mixHashPoint(...)`). This is *not* the
+# standard Noise pre-message mechanism.
+NOISE_PROLOGUE_BYTE_RESPONDER_STATIC = 0  # NKpsk0: responder's key is pre-shared
+NOISE_PROLOGUE_BYTE_INITIATOR_STATIC = 1  # KNpsk0: initiator's key is pre-shared
+
 NOISE_DH_PUBLIC_KEY_SIZE = 65  # uncompressed P-256 point: 0x04 || X (32) || Y (32)
 NOISE_HASH_SIZE = 32  # SHA-256 digest size
 NOISE_AEAD_KEY_SIZE = 32  # AES-256
 NOISE_AEAD_TAG_SIZE = 16
 NOISE_AEAD_NONCE_SIZE = 12
 
+# Post-handshake transport messages are padded to a multiple of this many
+# bytes (final byte = number of preceding padding bytes, minus one) before
+# being AES-256-GCM encrypted. 32 is the spec-recommended granularity.
+TRANSPORT_PADDING_GRANULARITY = 32
+
 # --- HKDF "info" derivation constants ----------------------------------------
 #
 # Various session secrets are derived from the QR secret (and other inputs)
-# via HKDF-SHA256, using a 4-byte little-endian integer as the `info` parameter.
+# via HKDF-SHA256, using a 4-byte little-endian integer as the `info`
+# parameter, where only the low-order byte (the purpose number) is non-zero.
 # Each `DerivedValueType` below corresponds to one such derivation purpose.
 
 
 class DerivedValueType:
-    EID_KEY = 0x01000000
-    TUNNEL_ID = 0x02000000
-    PSK = 0x03000000
-    PAIRED_SECRET = 0x04000000
-    IDENTITY_KEY_SEED = 0x05000000
-    PER_CONTACT_ID_SECRET = 0x06000000
+    EID_KEY = 1
+    TUNNEL_ID = 2
+    PSK = 3
+    PAIRED_SECRET = 4
+    IDENTITY_KEY_SEED = 5
+    PER_CONTACT_ID_SECRET = 6
 
 
 def derived_value_info_bytes(value_type: int) -> bytes:

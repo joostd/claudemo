@@ -22,12 +22,14 @@ from .constants import (
     HANDSHAKE_FIELD_PEER_IDENTITY,
     HANDSHAKE_FIELD_REQUEST_TYPE,
     HANDSHAKE_FIELD_SECRET,
+    HANDSHAKE_FIELD_SUPPORTED_TRANSPORTS,
     HANDSHAKE_FIELD_SUPPORTS_LINKING_INFO,
-    HANDSHAKE_FIELD_SUPPORTS_NON_DISCOVERABLE_MC,
     HANDSHAKE_FIELD_TIMESTAMP,
     KNOWN_TUNNEL_DOMAINS,
+    QR_PEER_IDENTITY_SIZE,
     QR_SECRET_SIZE,
     REQUEST_TYPE_GET_ASSERTION,
+    TRANSPORT_CHANNEL_WEBSOCKET,
 )
 
 
@@ -35,18 +37,23 @@ from .constants import (
 class HandshakeV2:
     """The payload encoded into a hybrid-transport QR code."""
 
-    peer_identity: bytes  # uncompressed P-256 public key point (65 bytes)
+    peer_identity: bytes  # 33-byte compressed X9.62 P-256 public key point
     secret: bytes = field(default=b"")  # 16 random "QR secret" bytes
     timestamp: int = field(default_factory=lambda: int(time.time()))
     request_type: str = REQUEST_TYPE_GET_ASSERTION
     known_domains_count: int = len(KNOWN_TUNNEL_DOMAINS)
     supports_linking_info: bool = False
-    supports_non_discoverable_make_credential: bool = False
+    supported_transports: list[int] = field(default_factory=lambda: [TRANSPORT_CHANNEL_WEBSOCKET])
 
     def __post_init__(self) -> None:
         if len(self.secret) != QR_SECRET_SIZE:
             raise ValueError(
                 f"QR secret must be {QR_SECRET_SIZE} bytes, got {len(self.secret)}"
+            )
+        if len(self.peer_identity) != QR_PEER_IDENTITY_SIZE:
+            raise ValueError(
+                f"peer identity must be a {QR_PEER_IDENTITY_SIZE}-byte compressed "
+                f"public key, got {len(self.peer_identity)} bytes"
             )
 
 
@@ -59,9 +66,7 @@ def encode_handshake(handshake: HandshakeV2) -> bytes:
         HANDSHAKE_FIELD_TIMESTAMP: handshake.timestamp,
         HANDSHAKE_FIELD_SUPPORTS_LINKING_INFO: handshake.supports_linking_info,
         HANDSHAKE_FIELD_REQUEST_TYPE: handshake.request_type,
-        HANDSHAKE_FIELD_SUPPORTS_NON_DISCOVERABLE_MC: (
-            handshake.supports_non_discoverable_make_credential
-        ),
+        HANDSHAKE_FIELD_SUPPORTED_TRANSPORTS: list(handshake.supported_transports),
     }
     return cbor2.dumps(cbor_map, canonical=True)
 
@@ -76,9 +81,7 @@ def decode_handshake(data: bytes) -> HandshakeV2:
         timestamp=cbor_map[HANDSHAKE_FIELD_TIMESTAMP],
         supports_linking_info=cbor_map[HANDSHAKE_FIELD_SUPPORTS_LINKING_INFO],
         request_type=cbor_map[HANDSHAKE_FIELD_REQUEST_TYPE],
-        supports_non_discoverable_make_credential=cbor_map[
-            HANDSHAKE_FIELD_SUPPORTS_NON_DISCOVERABLE_MC
-        ],
+        supported_transports=list(cbor_map[HANDSHAKE_FIELD_SUPPORTED_TRANSPORTS]),
     )
 
 
