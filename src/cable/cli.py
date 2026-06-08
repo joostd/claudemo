@@ -21,7 +21,6 @@ import time
 
 import cbor2
 import click
-from fido2.ctap2.pin import ClientPin
 
 from . import qr
 from .constants import (
@@ -159,19 +158,25 @@ async def _connect_and_handshake(*, request_type: str, debug_noise: bool):
     channel = CableChannel(tunnel, send_cipher=result.send_cipher, receive_cipher=result.receive_cipher)
 
     # The authenticator's first message is a bare (non-type-byte-framed) CBOR
-    # map carrying its cached authenticatorGetInfo response, sent to save a
-    # round trip. We must read and validate it before any typed CTAP exchange
-    # begins, or the channel will desync from the authenticator's framing --
-    # and, since it *is* the getInfo response, we must also use it as such
-    # rather than asking again: confirmed that some authenticators (iOS) close
-    # the tunnel on a redundant `authenticatorGetInfo` (see `_run_session`).
+    # *wrapper* map carrying its cached authenticatorGetInfo response under
+    # key 1 -- CBOR-in-CBOR: that key's value is itself a byte string holding
+    # the getInfo response map's canonical CBOR encoding, not the decoded map
+    # directly (confirmed by reassembling the bytes a naive `Info.from_dict`
+    # on the *outer* map misparsed into `versions` -- they decode cleanly to
+    # `{1: ['FIDO_2_0', ...], 4: {'rk': True, 'uv': True, ...}, ...}`).
+    # We must read and validate it before any typed CTAP exchange begins, or
+    # the channel will desync from the authenticator's framing -- and, since
+    # it *is* the getInfo response, we must also use it as such rather than
+    # asking again: confirmed that some authenticators (iOS) close the tunnel
+    # on a redundant `authenticatorGetInfo` (see `_run_session`).
     post_handshake = cbor2.loads(await channel.recv_post_handshake())
-    if not isinstance(post_handshake, dict) or post_handshake.get(1) is None:
+    if not isinstance(post_handshake, dict) or not isinstance(post_handshake.get(1), bytes):
         raise RuntimeError(
             "post-handshake message did not contain a cached authenticatorGetInfo "
-            "response (CBOR map key 1) -- protocol framing mismatch."
+            "response (CBOR map key 1, holding a nested CBOR-encoded getInfo byte "
+            "string) -- protocol framing mismatch."
         )
-    cached_info = _lenient_info_from_dict(post_handshake)
+    cached_info = _lenient_info_from_dict(cbor2.loads(post_handshake[1]))
     log("Received post-handshake message (cached authenticatorGetInfo response).")
 
     return channel, result, cached_info
@@ -284,42 +289,24 @@ def make_credential(
     """Request a CTAP2 MakeCredential from the phone."""
 
     def action(ctap2):
-        client_data_hash = _client_data_hash(challenge.encode())
-
-        # iOS's iCloud Keychain authenticator mandates user verification for
-        # passkey *creation* (unlike assertions, which it will satisfy with
-        # plain user presence): a bare `authenticatorMakeCredential` lacking
-        # `pinUvAuthParam` is silently rejected -- no Face ID prompt, no
-        # structured CTAP2 error, just an immediate tunnel close ("operation
+        # iOS's cached getInfo (correctly parsed -- see the post-handshake
+        # CBOR-in-CBOR fix in `_connect_and_handshake`) reports
+        # `options: {rk: True, uv: True, jsonMessages: True}`: no `clientPin`/
+        # `pinUvAuthToken`, i.e. it authenticates via *built-in* user
+        # verification requested directly through the `uv` option (the older,
+        # token-less mechanism), not the `authenticatorClientPIN` token dance.
+        # Without `uv: true` here, iOS apparently won't perform (or even
+        # prompt for) the verification a passkey-creation ceremony requires --
+        # and rather than return a structured CTAP2 error for the unmet
+        # requirement, it silently aborts and closes the tunnel ("operation
         # could not be completed" on the phone, "Peer sent a close frame"
-        # here). The standard fix is the `authenticatorClientPIN`
-        # getKeyAgreement -> getPinUvAuthTokenUsingUvWithPermissions dance
-        # (which is what actually triggers the Face ID prompt), yielding a
-        # UV token that's then MACed over `client_data_hash` into
-        # `pin_uv_param` per CTAP 2.3 sctn-6.5.5.7.
-        pin_uv_param = None
-        pin_uv_protocol = None
-        if ClientPin.is_token_supported(ctap2.info):
-            client_pin = ClientPin(ctap2)
-            uv_token = client_pin.get_uv_token(
-                permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
-                permissions_rpid=rp_id,
-            )
-            pin_uv_param = client_pin.protocol.authenticate(uv_token, client_data_hash)
-            pin_uv_protocol = client_pin.protocol.VERSION
-
+        # here).
         response = ctap2.make_credential(
-            client_data_hash=client_data_hash,
+            client_data_hash=_client_data_hash(challenge.encode()),
             rp={"id": rp_id, "name": rp_name or rp_id},
             user={"id": user_id.encode(), "name": user_name},
             key_params=[{"type": "public-key", "alg": -7}],
-            # Platform authenticators that only ever produce passkeys (e.g.
-            # iOS's iCloud Keychain) cannot create a non-discoverable
-            # credential; `rk=True` is what real passkey-creation requests
-            # (`residentKey: "required"`) ask for.
-            options={"rk": True},
-            pin_uv_param=pin_uv_param,
-            pin_uv_protocol=pin_uv_protocol,
+            options={"rk": True, "uv": True},
         )
         click.echo(response)
 

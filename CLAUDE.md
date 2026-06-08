@@ -139,13 +139,27 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   bypassing `Ctap2.__init__`'s own `authenticatorGetInfo` round trip -- the
   cached response was sent precisely to make that redundant, and at least one
   real authenticator, iOS, closes the tunnel outright if asked again anyway).
-  That cached `getInfo` is parsed leniently (`_lenient_info_from_dict`):
-  confirmed that iOS includes newer/draft fields (`encIdentifier`,
+  The post-handshake message is itself a CBOR *wrapper* map whose key 1 holds
+  the actual `getInfo` response CBOR-encoded as a nested byte string --
+  CBOR-in-CBOR, confirmed by reassembling a real iOS device's bytes (a naive
+  parse of the outer map as `Info` directly misparses every field, e.g.
+  `versions` ends up holding the raw bytes of the inner encoding one byte at a
+  time; decoding `outer[1]` separately yields a clean
+  `{1: ['FIDO_2_0', ...], 4: {'rk': True, 'uv': True, ...}, ...}`) -- so
+  `cbor2.loads(outer[1])` must run before `_lenient_info_from_dict`. That
+  cached `getInfo` is parsed leniently (`_lenient_info_from_dict`): confirmed
+  that iOS includes newer/draft fields (`encIdentifier`,
   `pinComplexityPolicyURL`, `encCredStoreState`) shaped differently than this
   `fido2` version's `Info` dataclass expects (arrays/maps where it wants
   `bytes`), which makes the strict `Info.from_dict` abort the entire parse --
   fields it can't parse are dropped instead, since `Ctap2` only ever consults
-  the well-established core fields.
+  the well-established core fields. (iOS's real `options` --
+  `{rk: True, uv: True, jsonMessages: True}` -- is also why
+  `make-credential` passes `options={"rk": True, "uv": True}`: it
+  authenticates passkey creation via *built-in* UV requested directly through
+  the `uv` option, not the `clientPin`/`pinUvAuthToken` token mechanism, and
+  silently aborts the request -- no prompt, no CTAP2 error, just a tunnel
+  close -- if `uv` isn't requested.)
 
 ## Protocol uncertainty -- read before "fixing" the crypto/wire-format code
 
