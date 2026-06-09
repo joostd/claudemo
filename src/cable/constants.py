@@ -131,8 +131,9 @@ TUNNEL_ROUTING_ID_HEADER = "X-caBLE-Routing-ID"
 # advertised tunnel-server-id scheme. Only the well-known domains (IDs 0 and 1)
 # are implemented; "computed" domains (ID >= 256, derived via hashing) are not.
 KNOWN_TUNNEL_DOMAINS: dict[int, str] = {
-    0: "cable.ua5v.com",  # Google
-    1: "cable.auth.com",  # Apple
+    0: "cable.ua5v.com",   # Google
+    1: "cable.auth.com",   # Apple
+    261: "cable.pyzci7hxyjsvc.org",  # custom Pi tunnel server (domain_id 0x0105)
 }
 
 # --- Post-handshake message framing ------------------------------------------
