@@ -220,6 +220,10 @@ def _client_data_hash(challenge: bytes) -> bytes:
     return hashlib.sha256(challenge).digest()
 
 
+def _random_client_data_hash() -> bytes:
+    return secrets.token_bytes(32)
+
+
 @click.group()
 def main() -> None:
     """FIDO client over hybrid transport (caBLE v2): talk CTAP2 to a phone."""
@@ -257,16 +261,16 @@ def get_info(debug_noise: bool) -> None:
 
 @main.command("get-assertion")
 @click.option("--rp-id", required=True)
-@click.option("--challenge", required=True, help="Challenge string (will be SHA-256 hashed).")
+@click.option("--challenge", default=None, help="Challenge string (will be SHA-256 hashed). Defaults to a random 32-byte value.")
 @click.option("--credential-file", type=click.Path(exists=True, path_type=pathlib.Path), default=None,
               help="Saved credential file (from --save-credential) to restrict allowList and verify the response.")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
-def get_assertion(rp_id: str, challenge: str, credential_file: pathlib.Path | None, debug_noise: bool) -> None:
+def get_assertion(rp_id: str, challenge: str | None, credential_file: pathlib.Path | None, debug_noise: bool) -> None:
     """Request a CTAP2 GetAssertion from the phone."""
     saved = _load_credential(credential_file) if credential_file else None
 
     def action(ctap2):
-        cdh = _client_data_hash(challenge.encode())
+        cdh = _random_client_data_hash() if challenge is None else _client_data_hash(challenge.encode())
         allow_list = None
         if saved is not None:
             allow_list = [{"type": "public-key", "id": saved["credential_id"]}]
@@ -290,7 +294,7 @@ def get_assertion(rp_id: str, challenge: str, credential_file: pathlib.Path | No
 @click.option("--user-id", required=True, help="User ID string (will be UTF-8 encoded).")
 @click.option("--user-name", required=True)
 @click.option("--display-name", default="", help="Defaults to --user-name.")
-@click.option("--challenge", required=True, help="Challenge string (will be SHA-256 hashed).")
+@click.option("--challenge", default=None, help="Challenge string (will be SHA-256 hashed). Defaults to a random 32-byte value.")
 @click.option("--save-credential", type=click.Path(path_type=pathlib.Path), default=None,
               help="Path to save the credential (credential ID + public key) for later use with get-assertion.")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
@@ -300,13 +304,14 @@ def make_credential(
     user_id: str,
     user_name: str,
     display_name: str,
-    challenge: str,
+    challenge: str | None,
     save_credential: pathlib.Path | None,
     debug_noise: bool,
 ) -> None:
     """Request a CTAP2 MakeCredential from the phone."""
 
     def action(ctap2):
+        cdh = _random_client_data_hash() if challenge is None else _client_data_hash(challenge.encode())
         # WebAuthn's PublicKeyCredentialUserEntity requires both `name` *and*
         # `displayName` for registration (unlike `get_assertion`, which never
         # sends a user entity at all) -- real clients always populate both.
@@ -317,7 +322,7 @@ def make_credential(
         # silently, before ever reaching the UV/UI step ("operation could not
         # be completed" on the phone, "Peer sent a close frame" here).
         response = ctap2.make_credential(
-            client_data_hash=_client_data_hash(challenge.encode()),
+            client_data_hash=cdh,
             rp={"id": rp_id, "name": rp_name or rp_id},
             user={
                 "id": user_id.encode(),
