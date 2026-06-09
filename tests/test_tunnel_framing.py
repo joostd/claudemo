@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from cable.transport.tunnel import TunnelConnection, tunnel_url
+from cable.transport.tunnel import TunnelConnection, decode_tunnel_server_domain, tunnel_url
 
 
 class _FakeWebSocket:
@@ -74,6 +74,35 @@ def test_tunnel_url_known_domain():
     assert url == "wss://cable.ua5v.com/cable/connect/" + ("AB" * 3) + "/" + ("00" * 16)
 
 
-def test_tunnel_url_unknown_domain_raises():
-    with pytest.raises(NotImplementedError):
-        tunnel_url(999, b"\xaa" * 3, b"\x00" * 16)
+def test_tunnel_url_unassigned_domain_raises():
+    # IDs 0..255 are "assigned" -- if the ID isn't in KNOWN_TUNNEL_DOMAINS, raise.
+    with pytest.raises(ValueError):
+        tunnel_url(5, b"\xaa" * 3, b"\x00" * 16)
+
+
+def test_decode_tunnel_server_domain_pi_server():
+    # Verified against Chromium DecodeDomain(): SHA-256("caBLEv2 tunnel server domain"
+    # + b'\x05\x01\x00'), first 8 bytes LE uint64, base32 label + ".org".
+    assert decode_tunnel_server_domain(261) == "cable.pyzci7hxyjsvc.org"
+
+
+def test_decode_tunnel_server_domain_structure():
+    for domain_id in (256, 512, 999, 1000, 65535):
+        result = decode_tunnel_server_domain(domain_id)
+        assert result.startswith("cable."), result
+        parts = result.split(".")
+        assert len(parts) == 3, result
+        assert parts[2] in ("com", "org", "net", "info"), result
+        assert all(c in "abcdefghijklmnopqrstuvwxyz234567" for c in parts[1]), result
+
+
+def test_decode_tunnel_server_domain_rejects_assigned_ids():
+    with pytest.raises(ValueError):
+        decode_tunnel_server_domain(0)
+    with pytest.raises(ValueError):
+        decode_tunnel_server_domain(255)
+
+
+def test_tunnel_url_computed_domain():
+    url = tunnel_url(261, b"\xab" * 3, b"\x00" * 16)
+    assert url == "wss://cable.pyzci7hxyjsvc.org/cable/connect/" + ("AB" * 3) + "/" + ("00" * 16)

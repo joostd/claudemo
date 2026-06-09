@@ -128,13 +128,26 @@ TUNNEL_SUBPROTOCOL = "fido.cable"
 TUNNEL_ROUTING_ID_HEADER = "X-caBLE-Routing-ID"
 
 # Domains assigned a small integer ID in the QR's `known_domains_count` /
-# advertised tunnel-server-id scheme. Only the well-known domains (IDs 0 and 1)
-# are implemented; "computed" domains (ID >= 256, derived via hashing) are not.
+# advertised tunnel-server-id scheme.
+#
+# IDs 0..255 are "assigned" -- their domain names are fixed by the spec and
+# must be looked up in this table.  IDs >= 256 are "computed" -- the domain
+# name is derived deterministically from the ID via SHA-256 hashing (see
+# `decode_tunnel_server_domain` in transport/tunnel.py, and CTAP 2.3 §11.5
+# `decodeTunnelServerDomain`).
 KNOWN_TUNNEL_DOMAINS: dict[int, str] = {
-    0: "cable.ua5v.com",   # Google
-    1: "cable.auth.com",   # Apple
-    261: "cable.pyzci7hxyjsvc.org",  # custom Pi tunnel server (domain_id 0x0105)
+    0: "cable.ua5v.com",  # Google
+    1: "cable.auth.com",  # Apple
 }
+
+# Constants for the computed domain hashing scheme (CTAP 2.3 §11.5,
+# Chromium device/fido/cable/v2_handshake.cc `DecodeDomain`).
+# Template: this prefix (28 bytes) + domain_id as uint16 LE + \x00 = 31 bytes.
+TUNNEL_DOMAIN_HASH_PREFIX: bytes = b"caBLEv2 tunnel server domain"
+# RFC 4648 base32 alphabet (lower-case).
+TUNNEL_DOMAIN_BASE32_CHARS: str = "abcdefghijklmnopqrstuvwxyz234567"
+# TLD indexed by (sha256_result & 3).
+TUNNEL_DOMAIN_TLDS: tuple[str, ...] = ("com", "org", "net", "info")
 
 # --- Post-handshake message framing ------------------------------------------
 #

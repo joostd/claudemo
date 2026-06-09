@@ -10,9 +10,46 @@ that layer. `TunnelConnection` only handles the raw frame plumbing.
 
 from __future__ import annotations
 
+import hashlib
+import struct
+
 import websockets
 
-from ..constants import KNOWN_TUNNEL_DOMAINS, TUNNEL_ROUTING_ID_HEADER, TUNNEL_SUBPROTOCOL
+from ..constants import (
+    KNOWN_TUNNEL_DOMAINS,
+    TUNNEL_DOMAIN_BASE32_CHARS,
+    TUNNEL_DOMAIN_HASH_PREFIX,
+    TUNNEL_DOMAIN_TLDS,
+    TUNNEL_ROUTING_ID_HEADER,
+    TUNNEL_SUBPROTOCOL,
+)
+
+
+def decode_tunnel_server_domain(domain_id: int) -> str:
+    """Compute the tunnel server hostname for a 'computed' domain ID (>= 256).
+
+    CTAP 2.3 §11.5 `decodeTunnelServerDomain` / Chromium `DecodeDomain`:
+    SHA-256(prefix || domain_id_LE16 || 0x00), first 8 bytes as uint64 LE;
+    bottom 2 bits select the TLD, remaining bits are base32-encoded to form
+    the label; the full hostname is "cable.<label>.<tld>".
+    """
+    if domain_id < 256:
+        raise ValueError(
+            f"domain_id {domain_id} is in the assigned range (0..255); "
+            "use KNOWN_TUNNEL_DOMAINS for those IDs"
+        )
+    template = bytearray(31)
+    template[:28] = TUNNEL_DOMAIN_HASH_PREFIX
+    struct.pack_into("<H", template, 28, domain_id)
+    digest = hashlib.sha256(bytes(template)).digest()
+    result = struct.unpack_from("<Q", digest)[0]  # first 8 bytes as uint64 LE
+    tld = TUNNEL_DOMAIN_TLDS[result & 3]
+    result >>= 2
+    label: list[str] = []
+    while result != 0:
+        label.append(TUNNEL_DOMAIN_BASE32_CHARS[result & 31])
+        result >>= 5
+    return "cable." + "".join(label) + "." + tld
 
 
 def tunnel_url(domain_id: int, routing_id: bytes, tunnel_id: bytes) -> str:
@@ -22,15 +59,16 @@ def tunnel_url(domain_id: int, routing_id: bytes, tunnel_id: bytes) -> str:
     (hex)>/<tunnel id (hex)>`; the routing ID comes from the decrypted BLE
     advertisement (it cannot be known before that advertisement is seen).
     """
-    try:
-        domain = KNOWN_TUNNEL_DOMAINS[domain_id]
-    except KeyError as exc:
-        raise NotImplementedError(
-            f"tunnel server domain id {domain_id} is not one of the known "
-            f"domains {sorted(KNOWN_TUNNEL_DOMAINS)}; 'computed' domain "
-            "derivation for higher IDs is not implemented (its hashing "
-            "scheme is not confirmed against any reference)."
-        ) from exc
+    if domain_id < 256:
+        try:
+            domain = KNOWN_TUNNEL_DOMAINS[domain_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"tunnel server domain id {domain_id} is in the assigned range (0..255) "
+                f"but not present in KNOWN_TUNNEL_DOMAINS {sorted(KNOWN_TUNNEL_DOMAINS)}"
+            ) from exc
+    else:
+        domain = decode_tunnel_server_domain(domain_id)
     # Chromium's `GetConnectURL` builds this path with `base::HexEncode`,
     # which produces *uppercase* hex digits (see v2_handshake.cc) -- both
     # sides must compute byte-identical URLs for the tunnel server to pair
@@ -88,4 +126,4 @@ class TunnelConnection:
         return frame
 
 
-__all__ = ["TunnelConnection", "tunnel_url"]
+__all__ = ["TunnelConnection", "tunnel_url", "decode_tunnel_server_domain"]
