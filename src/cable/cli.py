@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import pathlib
 import secrets
 import time
 
 import cbor2
 import click
+from fido2.cose import CoseKey
 
 from . import qr
 from .constants import (
@@ -256,13 +258,24 @@ def get_info(debug_noise: bool) -> None:
 @main.command("get-assertion")
 @click.option("--rp-id", required=True)
 @click.option("--challenge", required=True, help="Challenge string (will be SHA-256 hashed).")
+@click.option("--credential-file", type=click.Path(exists=True, path_type=pathlib.Path), default=None,
+              help="Saved credential file (from --save-credential) to restrict allowList and verify the response.")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
-def get_assertion(rp_id: str, challenge: str, debug_noise: bool) -> None:
+def get_assertion(rp_id: str, challenge: str, credential_file: pathlib.Path | None, debug_noise: bool) -> None:
     """Request a CTAP2 GetAssertion from the phone."""
+    saved = _load_credential(credential_file) if credential_file else None
 
     def action(ctap2):
-        response = ctap2.get_assertion(rp_id, _client_data_hash(challenge.encode()))
+        cdh = _client_data_hash(challenge.encode())
+        allow_list = None
+        if saved is not None:
+            allow_list = [{"type": "public-key", "id": saved["credential_id"]}]
+        response = ctap2.get_assertion(rp_id, cdh, allow_list=allow_list)
         click.echo(response)
+        if saved is not None:
+            public_key = CoseKey.parse(saved["public_key"])
+            response.verify(cdh, public_key)
+            click.echo(click.style("Signature verified against saved credential.", fg="green", bold=True), err=True)
 
     _run_session(
         request_type=REQUEST_TYPE_GET_ASSERTION,
@@ -278,6 +291,8 @@ def get_assertion(rp_id: str, challenge: str, debug_noise: bool) -> None:
 @click.option("--user-name", required=True)
 @click.option("--display-name", default="", help="Defaults to --user-name.")
 @click.option("--challenge", required=True, help="Challenge string (will be SHA-256 hashed).")
+@click.option("--save-credential", type=click.Path(path_type=pathlib.Path), default=None,
+              help="Path to save the credential (credential ID + public key) for later use with get-assertion.")
 @click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
 def make_credential(
     rp_id: str,
@@ -286,6 +301,7 @@ def make_credential(
     user_name: str,
     display_name: str,
     challenge: str,
+    save_credential: pathlib.Path | None,
     debug_noise: bool,
 ) -> None:
     """Request a CTAP2 MakeCredential from the phone."""
@@ -316,6 +332,12 @@ def make_credential(
             options={"rk": True},
         )
         click.echo(response)
+        if save_credential is not None:
+            _save_credential(save_credential, response)
+            click.echo(
+                click.style(f"Credential saved to {save_credential}.", fg="green", bold=True),
+                err=True,
+            )
 
     _run_session(
         request_type=REQUEST_TYPE_MAKE_CREDENTIAL,
@@ -342,6 +364,20 @@ def _ctap2_from_cached_info(device, info):
     ctap2._info = info
     ctap2._max_msg_size = info.max_msg_size
     return ctap2
+
+
+def _save_credential(path: pathlib.Path, response) -> None:
+    """Persist credential_id and public_key from an AttestationResponse to a CBOR file."""
+    cred_data = response.auth_data.credential_data
+    path.write_bytes(cbor2.dumps({
+        "credential_id": cred_data.credential_id,
+        "public_key": dict(cred_data.public_key),
+    }))
+
+
+def _load_credential(path: pathlib.Path) -> dict:
+    """Load a credential file written by _save_credential."""
+    return cbor2.loads(path.read_bytes())
 
 
 def _run_session(*, request_type, debug_noise, action) -> None:
