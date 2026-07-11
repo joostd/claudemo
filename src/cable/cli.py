@@ -271,6 +271,71 @@ def get_assertion(rp_id: str, challenge: str, debug_noise: bool) -> None:
     )
 
 
+@main.command("large-blob-array")
+@click.option(
+    "--large-blob-key",
+    help=(
+        "Hex-encoded largeBlobKey for a single credential (obtained from a prior "
+        "get-assertion/make-credential with the largeBlobKey extension enabled). "
+        "If given, decrypts and prints just that credential's blob instead of "
+        "dumping the raw array."
+    ),
+)
+@click.option("--output", type=click.Path(dir_okay=False, writable=True), help="Write the result to a file instead of stdout.")
+@click.option("--debug-noise", is_flag=True, help="Log Noise handshake transcript values.")
+def large_blob_array(large_blob_key: str, output: str, debug_noise: bool) -> None:
+    """Download the authenticator's largeBlobArray (CTAP2.1 authenticatorLargeBlobs).
+
+    Reading the array requires no PIN/UV per the spec, but each entry's
+    payload is only readable if you also hold the per-credential
+    largeBlobKey -- pass --large-blob-key to decrypt one entry, or omit it
+    to dump the raw (still-encrypted) entries.
+    """
+    from fido2.ctap2.blob import LargeBlobs
+
+    key_bytes = None
+    if large_blob_key:
+        try:
+            key_bytes = bytes.fromhex(large_blob_key)
+        except ValueError as exc:
+            raise click.BadParameter(str(exc), param_hint="--large-blob-key") from exc
+
+    def action(ctap2):
+        if not LargeBlobs.is_supported(ctap2.info):
+            raise click.ClickException("authenticator does not support the largeBlobs CTAP2.1 extension")
+        large_blobs = LargeBlobs(ctap2)
+
+        if key_bytes is not None:
+            blob = large_blobs.get_blob(key_bytes)
+            if blob is None:
+                raise click.ClickException("no large blob found for the given --large-blob-key")
+            if output:
+                with open(output, "wb") as f:
+                    f.write(blob)
+                click.echo(f"Wrote {len(blob)} bytes to {output}", err=True)
+            else:
+                click.echo(blob)
+            return
+
+        entries = large_blobs.read_blob_array()
+        click.echo(f"{len(entries)} entries in largeBlobArray", err=True)
+        if output:
+            import cbor2 as _cbor2
+
+            with open(output, "wb") as f:
+                f.write(_cbor2.dumps(entries))
+            click.echo(f"Wrote raw CBOR array to {output}", err=True)
+        else:
+            for i, entry in enumerate(entries):
+                click.echo(f"[{i}] {entry}")
+
+    _run_session(
+        request_type=REQUEST_TYPE_GET_ASSERTION,
+        debug_noise=debug_noise,
+        action=action,
+    )
+
+
 @main.command("make-credential")
 @click.option("--rp-id", required=True)
 @click.option("--rp-name", default="")

@@ -24,6 +24,8 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[test]"
 .venv/bin/cable get-info                     # full flow: connect to a phone, print GetInfo
 .venv/bin/cable get-assertion --rp-id ... --challenge ...
 .venv/bin/cable make-credential --rp-id ... --user-id ... --user-name ... --challenge ...
+.venv/bin/cable large-blob-array                          # dump the raw largeBlobArray
+.venv/bin/cable large-blob-array --large-blob-key <hex>    # decrypt one credential's blob
 python scripts/show_qr.py [ga|mc]            # manual QR-display helper, no install required
 ```
 
@@ -129,7 +131,7 @@ Module layout (each is independently unit-tested -- see "Protocol uncertainty" b
   `CableChannel` via a dedicated background event-loop thread
   (`_BackgroundLoop` + `asyncio.run_coroutine_threadsafe`).
 - `cli.py` -- `click`-based subcommands (`qr`, `get-info`, `get-assertion`,
-  `make-credential`) and orchestration of the end-to-end flow: generate
+  `make-credential`, `large-blob-array`) and orchestration of the end-to-end flow: generate
   ephemeral keypair + QR secret -> display QR -> **block on the BLE
   advertisement** -> derive routing ID / tunnel ID / PSK (salted with the full
   16-byte decrypted advert) from it -> connect to the tunnel and run the Noise

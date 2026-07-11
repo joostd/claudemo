@@ -37,5 +37,11 @@ def test_help_lists_subcommands():
     runner = CliRunner()
     result = runner.invoke(main, ["--help"])
     assert result.exit_code == 0
-    for name in ("qr", "get-info", "get-assertion", "make-credential"):
+    for name in ("qr", "get-info", "get-assertion", "make-credential", "large-blob-array"):
         assert name in result.output
+
+
+def test_large_blob_array_rejects_non_hex_key():
+    runner = CliRunner()
+    result = runner.invoke(main, ["large-blob-array", "--large-blob-key", "not-hex"])
+    assert result.exit_code != 0
